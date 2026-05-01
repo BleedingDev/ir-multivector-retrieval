@@ -184,8 +184,20 @@ pub fn train(
             try trainOneSubspace(residuals, dim, sub_dim, n_residuals, m, seed, n_threads, sub_buf, codebooks, gpa);
         }
     } else {
-        // ---- Parallel: chunk M=32 across workers. ----
-        const ChunkCtx = struct {
+        // ---- Parallel: work-stealing dispatch over M=32 subspaces. ----
+        // Plan-10: replaced the prior static `chunk = ceil(M/n_threads)` split
+        // with a shared atomic counter. The static chunker left fast workers
+        // idle while slow ones ground on harder subspaces — kmeans.fit per
+        // subspace converges in 5-25 Lloyd iterations and the variance
+        // dominated wall time at chunk=4. Each worker now pulls the next
+        // subspace via `next_subspace.fetchAdd(1, .monotonic)` until the index
+        // reaches PQ_M. Disjoint codebook slices
+        // `codebooks[m*256*sub_dim..(m+1)*256*sub_dim]` mean monotonic
+        // ordering is sufficient — no false sharing, no read-after-write
+        // hazard between workers. Codebook layout is m-indexed (not
+        // completion-order-indexed) and per-subspace seeds are
+        // `base_seed +% m`, so output is byte-equal across n_threads.
+        const WorkerCtx = struct {
             residuals: []const f32,
             dim: u32,
             sub_dim: u32,
@@ -194,19 +206,19 @@ pub fn train(
             kmeans_n_threads: u32,
             codebooks: []f32,
             gpa: Allocator,
+            next_subspace: *std.atomic.Value(u32),
             err_out: ?PqError,
-            lo: u32,
-            hi: u32,
         };
-        const ChunkRunner = struct {
-            fn run(ctx: *ChunkCtx) void {
+        const WorkerRunner = struct {
+            fn run(ctx: *WorkerCtx) void {
                 const sub_buf = ctx.gpa.alloc(f32, ctx.n_residuals * @as(usize, ctx.sub_dim)) catch |err| {
                     ctx.err_out = err;
                     return;
                 };
                 defer ctx.gpa.free(sub_buf);
-                var m = ctx.lo;
-                while (m < ctx.hi) : (m += 1) {
+                while (true) {
+                    const m = ctx.next_subspace.fetchAdd(1, .monotonic);
+                    if (m >= constants.PQ_M) break;
                     trainOneSubspace(ctx.residuals, ctx.dim, ctx.sub_dim, ctx.n_residuals, m, ctx.seed, ctx.kmeans_n_threads, sub_buf, ctx.codebooks, ctx.gpa) catch |err| {
                         ctx.err_out = err;
                         return;
@@ -216,7 +228,7 @@ pub fn train(
         };
 
         const real_threads = @min(n_threads, constants.PQ_M);
-        const ctxs = try gpa.alloc(ChunkCtx, real_threads);
+        const ctxs = try gpa.alloc(WorkerCtx, real_threads);
         defer gpa.free(ctxs);
         const threads = try gpa.alloc(std.Thread, real_threads);
         defer gpa.free(threads);
@@ -234,10 +246,8 @@ pub fn train(
             break :blk @max(1, n_threads / real_threads);
         };
 
-        const chunk = (constants.PQ_M + real_threads - 1) / real_threads;
+        var next_subspace = std.atomic.Value(u32).init(0);
         for (0..real_threads) |t| {
-            const lo: u32 = @intCast(t * chunk);
-            const hi: u32 = @min(@as(u32, @intCast((t + 1) * chunk)), constants.PQ_M);
             ctxs[t] = .{
                 .residuals = residuals,
                 .dim = dim,
@@ -247,11 +257,10 @@ pub fn train(
                 .kmeans_n_threads = kmeans_inner,
                 .codebooks = codebooks,
                 .gpa = gpa,
+                .next_subspace = &next_subspace,
                 .err_out = null,
-                .lo = lo,
-                .hi = hi,
             };
-            threads[t] = try std.Thread.spawn(.{}, ChunkRunner.run, .{&ctxs[t]});
+            threads[t] = try std.Thread.spawn(.{}, WorkerRunner.run, .{&ctxs[t]});
         }
         for (threads) |th| th.join();
         for (ctxs) |c| if (c.err_out) |err| return err;
@@ -431,6 +440,34 @@ test "train: deterministic — same seed → byte-equal codebooks" {
     var p2 = try train(buf, dim, 1234, 1, a);
     defer p2.deinit(a);
     try testing.expectEqualSlices(f32, p1.codebooks, p2.codebooks);
+}
+
+test "train: work-stealing dispatch is byte-equal across n_threads" {
+    // Plan-10 gate: the atomic-counter outer dispatch must produce
+    // bit-identical codebooks regardless of n_threads. Codebook layout is
+    // indexed by subspace m (not by worker completion order) and the
+    // per-subspace kmeans seed is `base_seed +% m`, so worker scheduling
+    // can't perturb the output. Test on a fixture sized so that all PQ_M=32
+    // subspaces actually get exercised under the parallel branch (n_threads
+    // > 1 takes the work-stealing path).
+    const a = std.testing.allocator;
+    const dim: u32 = 32; // sub_dim = 1 for PQ_M=32
+    const n: u32 = 512;
+    const buf = try a.alloc(f32, @as(usize, n) * @as(usize, dim));
+    defer a.free(buf);
+    var prng = std.Random.DefaultPrng.init(0xA701C);
+    for (buf) |*x| x.* = prng.random().floatNorm(f32);
+    try vec.normalizeRowsInPlace(buf, dim);
+
+    var p1 = try train(buf, dim, 4242, 1, a);
+    defer p1.deinit(a);
+    var p4 = try train(buf, dim, 4242, 4, a);
+    defer p4.deinit(a);
+    var p10 = try train(buf, dim, 4242, 10, a);
+    defer p10.deinit(a);
+
+    try testing.expectEqualSlices(f32, p1.codebooks, p4.codebooks);
+    try testing.expectEqualSlices(f32, p1.codebooks, p10.codebooks);
 }
 
 test "buildDistanceTable: matches direct dot product" {
