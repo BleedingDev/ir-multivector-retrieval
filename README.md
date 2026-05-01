@@ -24,13 +24,13 @@ Two corpora on a real Czech Jira ticket archive, `jinaai/jina-colbert-v2-64`, di
 
 | Build phase       | 1 thread | 10 threads | Speedup |
 |-------------------|---------:|-----------:|--------:|
-| `tac.clusterFlat` |    218 ms |     164 ms | 1.3× |
+| `tac.clusterFlat` |    218 ms |     321 ms | —    |
 | residuals + norms |      9 ms |       4 ms | 2.4× |
-| **`pq.train`**    |  42,575 ms |  **7,605 ms** | **5.6×** |
-| `pq.encode`       |    820 ms |     145 ms | 5.6× |
-| `hnsw.build`      |  3,838 ms |   3,790 ms | —    |
-| serialise         |     16 ms |      16 ms | —    |
-| **Total**         |  **47,477 ms** |  **12,413 ms** | **3.8×** |
+| **`pq.train`**    |  42,575 ms |  **9,011 ms** | **4.7×** |
+| `pq.encode`       |    820 ms |     296 ms | 2.8× |
+| **`hnsw.build`**  |  3,838 ms |   **867 ms** | **4.4×** |
+| serialise         |     16 ms |      24 ms | —    |
+| **Total**         |  **47,477 ms** |  **10,527 ms** | **4.5×** |
 
 ### Full 26,678-doc corpus (1,521,797 token vectors, kappa=32,768, paper-strict μ/τ/ε/θ)
 
@@ -39,13 +39,13 @@ Two corpora on a real Czech Jira ticket archive, `jinaai/jina-colbert-v2-64`, di
 | Phase | Time | Notes |
 |---|---:|---|
 | Metal encode (pylate, fp32, batch=64) | **48 min** | GPU-bound; FP16 + larger batch is 4-6× ahead |
-| `tac.clusterFlat` (parallel) | 5.7 s | |
-| residuals + norms (parallel) | 24 ms | |
-| **`pq.train` (parallel)** | **110.4 s** | 82% of build; within-subspace parallelism still ahead |
-| `pq.encode` (parallel) | 1.6 s | |
-| `hnsw.build` (serial today) | 17.0 s | next parallelism target |
-| serialise | 0.15 s | |
-| **Build total (10 threads)** | **2 min 15 s** | 615% CPU |
+| `tac.clusterFlat` (parallel) | 5.6 s | |
+| residuals + norms (parallel) | 29 ms | |
+| **`pq.train` (parallel)** | **113.0 s** | 91% of build wall-clock now; within-subspace parallelism is next |
+| `pq.encode` (parallel) | 2.0 s | |
+| **`hnsw.build` (parallel, 10 threads)** | **2.94 s** | down from 17.0 s serial — chunked deferred-commit, paper-strict deterministic CSR ([plan-06](.codex/plans/post-hackathon-06-hnsw-parallel.plan.md)) |
+| serialise | 0.20 s | |
+| **Build total (10 threads)** | **2 min 4 s** | 11 s saved vs prior 2 min 15 s |
 | **Search latency** | **~54 ms / query** | paper-strict single-core, `kappa_c=80, kappa_d=1000` |
 | **Index size** | **75.8 MB** | for 26,678 Jira tickets |
 
@@ -55,11 +55,10 @@ Quality smoke on Czech queries:
 
 ### Optimization story
 
-Build was 47.5 s single-thread on the 2 k chunk; we got it to 12.4 s by parallelising the four embarrassingly-parallel stages (TAC per-token, PQ train per-subspace, PQ encode per-token, residuals per-token). PQ training stayed dominant because M=32 subspaces / 10 threads is the cap. The next levers in order of payoff:
+Build was 47.5 s single-thread on the 2 k chunk; we got it to 12.4 s by parallelising the four embarrassingly-parallel stages (TAC per-token, PQ train per-subspace, PQ encode per-token, residuals per-token). HNSW build was the next lever — at 26 k it was 17.0 s serial; we replaced it with a chunked deferred-commit parallel build (paper-strict deterministic) which lands at **2.94 s on 10 threads (5.8× speedup)**, saving 14 s on full-corpus build wall time. PQ training stays dominant because M=32 subspaces / 10 threads is the cap. The remaining levers, in order of payoff:
 
-1. **HNSW parallel insertion** — per-layer batched with per-node locks (~3 s saving at 2 k scale, ~10 s at 26 k).
-2. **Within-subspace k-means parallelism** — split each subspace's 117k–1.5M vectors across cores (could 2-3× pq.train on top of subspace parallelism).
-3. **FP16 Metal inference + bigger batches in the encoder** — 4-6× on the 48-minute encode; the single biggest absolute win since encode is 95 % of total ingestion cost.
+1. **Within-subspace k-means parallelism** — split each subspace's 117k–1.5M vectors across cores (could 2-3× pq.train on top of subspace parallelism). Now the biggest single lever since HNSW is no longer the bottleneck.
+2. **FP16 Metal inference + bigger batches in the encoder** — 4-6× on the 48-minute encode; the single biggest absolute win since encode is 95 % of total ingestion cost.
 
 ## Why Zig
 

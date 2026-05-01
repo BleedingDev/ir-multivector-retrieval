@@ -293,10 +293,13 @@ const WorkerScratch = struct {
 
 /// Build an HNSW over `n = centroids.len / dim` L2-normalised vectors.
 ///
-/// Determinism: identical (centroids, dim, seed, params) → identical CSR.
-/// At `n_threads >= 2`, determinism holds across thread counts ≥ 2 (chunked
-/// deferred-commit path); CSR differs from `n_threads = 1` because the
-/// parallel path uses chunk-local snapshot reads. See module docstring.
+/// Determinism: for fixed `(centroids, dim, seed, params)` — and `n_threads`
+/// is part of `params` — the produced CSR is byte-identical across runs.
+/// `n_threads=1` matches a reference serial implementation byte-for-byte;
+/// `n_threads >= 2` uses chunked deferred-commit which produces a
+/// different-but-deterministic graph (chunks don't see same-chunk commits —
+/// standard parallel HNSW contract). Recall stays high; the bundled tests
+/// measure recall@10 ≈ 0.988 at n_threads=10 vs ≥ 0.9 floor.
 pub fn build(
     centroids: []const f32,
     dim: u32,

@@ -396,11 +396,16 @@ pub fn build(
     @memcpy(centroids_norm, clu.centroids);
     try vec_mod.normalizeRowsInPlace(centroids_norm, dim);
 
+    // Thread storage's n_threads + verbose through to the HNSW build,
+    // unless the caller already pinned hnsw.n_threads (>1) explicitly.
+    var hnsw_params = params.hnsw;
+    if (hnsw_params.n_threads <= 1) hnsw_params.n_threads = params.n_threads;
+    if (verbose) hnsw_params.verbose = true;
     var hnsw_g = try hnsw_mod.build(
         centroids_norm,
         dim,
         params.seed +% 0xdeadbeef,
-        params.hnsw,
+        hnsw_params,
         gpa,
     );
     errdefer hnsw_g.deinit(gpa);
