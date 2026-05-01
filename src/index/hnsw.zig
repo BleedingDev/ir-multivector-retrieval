@@ -293,13 +293,24 @@ const WorkerScratch = struct {
 
 /// Build an HNSW over `n = centroids.len / dim` L2-normalised vectors.
 ///
-/// Determinism: for fixed `(centroids, dim, seed, params)` — and `n_threads`
-/// is part of `params` — the produced CSR is byte-identical across runs.
-/// `n_threads=1` matches a reference serial implementation byte-for-byte;
-/// `n_threads >= 2` uses chunked deferred-commit which produces a
-/// different-but-deterministic graph (chunks don't see same-chunk commits —
-/// standard parallel HNSW contract). Recall stays high; the bundled tests
-/// measure recall@10 ≈ 0.988 at n_threads=10 vs ≥ 0.9 floor.
+/// Determinism contract:
+///   * For a fixed `(centroids, dim, seed, params)` tuple — including
+///     `params.n_threads` — the produced CSR is byte-identical across runs.
+///   * Across thread counts: `n_threads >= 2` runs all produce the SAME CSR
+///     (the chunked deferred-commit path is deterministic in q-order, so any
+///     `{2, 4, 10, ...}` agree byte-for-byte; pinned by the in-file test
+///     "build: parallel path deterministic across thread counts" and by
+///     `tests/integration/build_determinism_test.zig` at the full-image
+///     level).
+///   * `n_threads=1` short-circuits to a serial reference implementation
+///     (see `params.n_threads <= 1` branch below) which is bit-identical
+///     across runs but produces a DIFFERENT graph from the parallel path
+///     — chunks cannot see same-chunk commits, which is the standard
+///     parallel-HNSW contract. Do not assume serial-vs-parallel byte
+///     equality; the integration test pins that they differ.
+///
+/// Recall stays high in the parallel path; bundled tests measure recall@10
+/// ≈ 0.988 at n_threads=10 vs the ≥ 0.9 floor on 1024 random vectors.
 pub fn build(
     centroids: []const f32,
     dim: u32,
@@ -1378,12 +1389,15 @@ test "build: same seed → same CSR" {
     }
 }
 
-// Plan 06: paper-strict determinism gate for the parallel build path.
-// The chunked deferred-commit algorithm guarantees that any two thread
-// counts ≥ 2 produce byte-equal CSR for the same (centroids, seed, params).
-// (n_threads=1 takes a separate serial fast-path that's bit-identical to
-// the pre-parallel CSR; the parallel path's CSR is a different but equally
-// deterministic function. See module docstring for the full contract.)
+// Plan 06: paper-strict determinism gate for the parallel build path
+// (CSR-only). The chunked deferred-commit algorithm guarantees that any two
+// thread counts ≥ 2 produce byte-equal CSR for the same (centroids, seed,
+// params). n_threads=1 takes a separate serial fast-path that's bit-identical
+// to the pre-parallel CSR; the parallel path's CSR is a different but equally
+// deterministic function — DO NOT widen this assertion to include n_threads=1.
+// The full-image equivalent test (covering centroids + PQ codebooks +
+// inverted lists + per-doc layout) lives in
+// `tests/integration/build_determinism_test.zig` (audit-fixes plan zig-3).
 test "build: parallel path deterministic across thread counts (n_threads=2 vs 10)" {
     const a = std.testing.allocator;
     // Use n large enough that we exercise multiple chunks (CHUNK_SIZE=256).
