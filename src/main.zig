@@ -15,9 +15,13 @@ const tac = @import("tac");
 const Allocator = std.mem.Allocator;
 
 pub fn main(m: std.process.Init.Minimal) !void {
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa_state.deinit();
-    const gpa = gpa_state.allocator();
+    // Production CLI hot path: smp_allocator is the ReleaseFast allocator
+    // and is honest about peak/headline numbers; DebugAllocator was masking
+    // real allocator overhead in `tac index` and skewing benchmarks. Tests
+    // (`zig build test`) still go through std.testing.allocator, which
+    // preserves leak detection on test exit — see finding #10 in
+    // .codex/deep-research-zig-2026-05-01.txt.
+    const gpa = std.heap.smp_allocator;
 
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
