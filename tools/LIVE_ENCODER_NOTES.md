@@ -185,12 +185,14 @@ tokens). When retriever's #20 picks budgets for MS MARCO they will
 have plenty of active tokens (n_j ≥ τ) and can use κ_total in the
 hundreds-of-thousands range.
 
-## MLX path setup (post-hackathon plan-12, EXPERIMENTAL)
+## MLX path setup (post-hackathon plan-12)
 
 `tools/encode_mlx.py` is an additive Apple-Silicon-native re-port of
-encode.py via Apple's MLX framework. **It is not a drop-in replacement
-until the 4-gate parity contract is green** — see
-`tests/live/mlx_parity.py`. Until then, encode.py is the canonical path.
+encode.py via Apple's MLX framework. The 4-gate parity contract in
+`tests/live/mlx_parity.py` is **green** at both fp32 and fp16 on the
+100-doc fixture, with gates 1+2 also confirmed on 1000 real Jira docs.
+Encode.py remains the cross-platform canonical path; encode_mlx.py is
+the fast Apple-Silicon option.
 
 ### Dependencies
 
@@ -234,20 +236,98 @@ final linear projection) and writes
 `tools/.cache/<model>/mlx_weights.safetensors`. Run once per model, then
 `encode_mlx.py` mmaps the safetensors directly.
 
-### Parity gates (status: pending — gates not yet run)
+### Running the parity harness
 
-| gate | status |
+After provisioning + weight export:
+
+```bash
+zig build -Doptimize=ReleaseFast            # builds zig-out/bin/tac for gate 4
+tools/.venv/bin/python tests/live/mlx_parity.py --mlx-parity --dtype fp16
+```
+
+The script encodes the 100-doc fixture through both paths, parses the
+resulting `tokens.bin` v2 + the `.tac` index format directly, and exits
+non-zero on any gate failure. Default `zig build test` does NOT run this;
+parity testing is opt-in via the `--mlx-parity` flag.
+
+### Parity gate results (100-doc fixture)
+
+PyTorch fp32 CPU baseline vs MLX fp32:
+
+| gate | result |
 |---|---|
-| 1. token-id byte equality | not run |
-| 2. cosine ≥ 0.998 mean (≥ 0.99 min) | not run |
-| 3. two-run determinism | not run |
-| 4. downstream TAC cluster overlap | not run |
+| 1. token-id byte equality                  | PASS — 1592 ids match exactly |
+| 2. cosine ≥ 0.998 mean (≥ 0.99 min)        | PASS — mean 0.999998, min 0.999923, p1 0.999991 |
+| 3. two-run MLX determinism                 | PASS — 203776 floats BYTE-IDENTICAL |
+| 4. downstream TAC cluster overlap          | PASS — kappa=92 centroid cosine mean 0.999999, min 0.999997 |
+
+PyTorch fp32 CPU baseline vs MLX **fp16**:
+
+| gate | result |
+|---|---|
+| 1. token-id byte equality                  | PASS |
+| 2. cosine ≥ 0.998 mean (≥ 0.99 min)        | PASS — mean 0.999999, min 0.999873, p1 0.999997 |
+| 3. two-run MLX determinism                 | PASS — 203776 floats BYTE-IDENTICAL even at fp16 |
+| 4. downstream TAC cluster overlap          | PASS — centroid cosine mean 0.999999, min 0.999998 |
+
+Cross-corpus spot-check on 1000 real Jira docs (gates 1 + 2 only):
+
+| gate | mlx-fp32 | mlx-fp16 |
+|---|---|---|
+| 1. token-id byte equality      | PASS (55202 ids) | PASS (55202 ids) |
+| 2. cosine                      | mean 0.999997, min 0.999803 | mean 0.999998, min 0.999970 |
+
+Notable: **MLX is byte-deterministic across runs** at both fp32 and fp16
+on Apple Silicon. encode.py under the current pin set (transformers 4.57)
+is NOT — two back-to-back runs differ in ~99% of output floats with max
+abs ~1.5e-6 (fp32 ε-class) because transformers' `mean_resizing` path
+fires when pylate expands the BERT vocab to add ColBERT's `[D]` and
+`[Q]` tokens, advancing the global RNG without seeding before any
+forward pass. That drift is below the parity floor so it doesn't break
+gate 2, but it does mean MLX is now the more reproducible backend.
 
 ### Measured speedup
 
-Not yet measured. Plan 12's success criterion is **honest reporting**: if
-MLX delivers <1.5× over PyTorch FP16 on this hardware/model, this section
-will say so explicitly rather than parroting Apple's marketing 2-4×.
+End-to-end CLI wall-clock, back-to-back so HF cache + MLX kernels are warm:
+
+100-doc live fixture (1592 kept tokens, mostly short synthetic English):
+
+| invocation                                | wall   | speedup |
+|-------------------------------------------|--------|---------|
+| encode.py fp32 cpu, batch=32              | 11.48s | 1.00×   |
+| encode_mlx.py fp32, batch=32              | 10.08s | 1.14×   |
+| encode_mlx.py fp16, batch=32              |  7.97s | **1.44×** |
+
+1000-doc Jira subset (55202 kept tokens, avg ~2.7 kB per doc):
+
+| invocation                                | wall   | speedup |
+|-------------------------------------------|--------|---------|
+| encode.py fp32 cpu, batch=32              | 67.72s | 1.00×   |
+| encode_mlx.py fp32, batch=32              | 19.52s | **3.47×** |
+| encode_mlx.py fp16, batch=32              | 16.18s | **4.19×** |
+
+The 100-doc fixture is too small to amortize tokenizer + cold-start cost
+(fixed overhead dominates wall). The 1000-doc Jira subset is closer to
+real workloads and shows MLX's actual lever: ~3.5× at fp32, ~4.2× at fp16
+over PyTorch's cpu fp32 path. Note we're NOT comparing against PyTorch
+MPS fp16 — that path's separate measurements live in the
+`### Measured speedup (Apple Silicon, jina-colbert-v2-64)` table above
+(fp16 MPS at 9.6s on 100-doc, 90.18s on 1000-doc Jira; against those
+numbers MLX is roughly comparable on tiny fixtures and ~5–6× on the Jira
+subset).
+
+### Recommendation
+
+- Use `tools/encode.py` on cpu / cuda when reproducibility across machine
+  classes matters more than encode wall-clock; it is the canonical path
+  and what every benchmark we publish was measured on.
+- Use `tools/encode_mlx.py` on Apple Silicon when encode wall-clock
+  matters: it is parity-tested, byte-deterministic across runs, and
+  ~3–4× faster than encode.py on cpu fp32 / 1000-doc real corpora.
+  Token IDs are byte-identical and per-token cosine ≥ 0.9998 vs the
+  pylate path, so downstream TAC indexing is interchangeable in
+  practice (gate 4 confirmed centroid cosine ≥ 0.99999 at the live
+  fixture's kappa=92 budget).
 
 ## Failure modes worth flagging
 
