@@ -513,6 +513,51 @@ CLI flags exposed: `--n-queries`, `--top-k`, `--search-overlap-floor`.
 Gate 5 piggy-backs on the existing fixture binaries (no extra encode
 pass), so total harness wall-clock is unchanged.
 
+## Wave 2 deferred MLX perf recs (2026-05-01)
+
+The post-audit MLX consult (`.codex/plans/post-hackathon-13-mlx-perf-consult.txt`)
+left four recs deferred behind the parity-stability gate that the audit
+explicitly required to land first. With all five gates green and the
+post-audit baseline below as the starting point, this wave applies the
+deferred recs sequentially with the parity harness re-run between each.
+
+Post-audit baselines (from `.codex/bench-outputs/rebench_results.jsonl`,
+2 warmups discarded + 3 measured):
+
+| cell | median wall | min |
+|---|---:|---:|
+| 100-doc fp16 b=128                        |  6.55s |  6.47s |
+| 1000-doc fp32 cpu (encode.py) baseline    | 93.17s | 84.36s |
+| 1000-doc fp16 b=128 + sort                | 14.72s | 12.64s |
+
+### Rec #1 — remove pylate ColBERT load from MLX path
+
+`tools/encode_mlx.py` previously instantiated `pylate.models.ColBERT(...)`
+solely to call `tokenize` and read `skiplist`. That carried the full
+sentence-transformers + transformers-4.57 mean_resizing vocab-expansion
+construction cost (~3-5s per CLI invocation), which dominated the
+small-corpus wall.
+
+The exporter now records skiplist + tokenizer-side metadata (document
+prefix id, document_length) into `config.json`, and the encoder uses
+`AutoTokenizer.from_pretrained(...)` directly with manual `[D]` prefix
+insertion. Setting `tokenizer.pad_token_id = 103` ([MASK]) reproduces
+pylate's docs-path tokenizer state byte-equally. All five parity gates
+remained green; per-token cosine min held at 0.999826.
+
+| cell | wave-2 baseline | rec-#1 median | delta |
+|---|---:|---:|---:|
+| 100-doc fp16 b=128                | 6.55s |  4.44s | **-32%** |
+| 1000-doc fp16 b=128 + sort        |14.72s |  8.89s | **-40%** |
+
+Bigger than the consult's optimistic 25-40% on small corpus and well
+beyond its <5% expectation on the large one. The 1000-doc gain is
+correlated with run noise (samples 7.75-9.43s), but every measured
+sample beat the worst sample of the wave-2 baseline. Honest read: pylate
+was a fixed per-process cost, so the relative win is approximately
+`pylate_load_s / total_wall_s`, which is largest on small jobs but still
+double-digit on 15-second jobs.
+
 ## Failure modes worth flagging
 
 - If a future pylate revision breaks the `model.tokenize` →

@@ -6,11 +6,14 @@ Owner: post-hackathon plan-12 (mlx-encoder-engineer).
 EXPERIMENTAL until the 4-gate parity contract in
 `tests/live/mlx_parity.py` is green.
 
-Reuses the HuggingFace tokenizer via pylate's `model.tokenize` (HF
-tokenizers are deterministic CPU code, fast, and the only way to get
-byte-equal token_ids). Implements the BERT base forward pass directly in
-mlx.nn (no mlx_lm BERT class today). Outputs the same tokens.bin v2
-format via the shared writer in tools/_tokens_bin.py.
+Uses the HuggingFace `AutoTokenizer` directly; the ColBERT `[D]` prefix
+and the punctuation skiplist come from the sidecar config emitted by
+tools/export_colbert_to_mlx.py. This avoids a `pylate.models.ColBERT`
+construction at inference time (a fixed cost that buried the small-corpus
+speedup pre-rec-01) while remaining byte-equal on token_ids vs the pylate
+docs path. Implements the BERT base forward pass directly in mlx.nn (no
+mlx_lm BERT class today). Outputs the same tokens.bin v2 format via the
+shared writer in tools/_tokens_bin.py.
 
 Usage:
     tools/.venv/bin/python tools/encode_mlx.py \\
@@ -386,7 +389,14 @@ def encode_docs_mlx(
 ) -> tuple[list[EncodedDoc], list[tuple[str, str]], int]:
     """Encode docs through MLX. Returns (encoded, dropped, dim).
 
-    Tokenizer + skiplist come from pylate (CPU, deterministic, fast).
+    Tokenizer comes from HuggingFace `AutoTokenizer` directly; the ColBERT
+    `[D]` prefix and the skiplist (punctuation BERT IDs) come from the
+    sidecar config emitted by tools/export_colbert_to_mlx.py. This avoids
+    instantiating `pylate.models.ColBERT` at inference time, which was a
+    fixed cost (~3-5s) that buried the small-corpus speedup. The token_ids
+    produced here are byte-equal to pylate's docs path under the live
+    parity harness.
+
     Forward pass + L2-norm run in MLX. Output rows match the keep-mask
     (skiplist & attention_mask), exactly as encode.py does.
 
@@ -394,18 +404,8 @@ def encode_docs_mlx(
     batching so each padded batch's max-T shrinks. Output order is restored
     to input order before return so doc_id_map / qid_map remain unchanged.
     """
-    # Tokenizer comes from pylate. We don't run model.forward through pylate
-    # — only model.tokenize and model.skiplist_mask.
-    from pylate import models  # type: ignore
+    from transformers import AutoTokenizer  # type: ignore
     import numpy as np
-
-    pl = models.ColBERT(
-        model_name_or_path=model_name,
-        trust_remote_code=trust_remote_code,
-        device="cpu",
-    )
-    pl.eval()
-    skiplist = pl.skiplist  # list[int]
 
     # Read MLX safetensors + config.
     if not weights_path.exists():
@@ -416,6 +416,38 @@ def encode_docs_mlx(
     if not config_path.exists():
         raise SystemExit(f"config.json missing next to {weights_path}")
     cfg = json.loads(config_path.read_text(encoding="utf-8"))
+
+    # Tokenizer-side metadata required for the docs path. config v1
+    # (pre-rec-01) didn't carry these; in that case fail with a clear
+    # message asking the user to re-export.
+    required_tok_keys = (
+        "skiplist", "document_length", "document_prefix_id",
+    )
+    missing_tok = [k for k in required_tok_keys if k not in cfg]
+    if missing_tok:
+        raise SystemExit(
+            f"config.json missing tokenizer-side keys {missing_tok} — "
+            f"re-run tools/export_colbert_to_mlx.py to refresh the sidecar "
+            f"(format_version >= 2 required)"
+        )
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name, trust_remote_code=trust_remote_code
+    )
+    # Match pylate's pad_token_id (= [MASK] = 103 on bert-base) so attended
+    # tokens and pad tokens are byte-equal vs pylate's docs path; pad
+    # positions are excluded by attention_mask anyway, so the model output
+    # at kept positions does not depend on this choice — we set it for
+    # determinism vs the pylate baseline only.
+    tokenizer.pad_token_id = int(cfg.get("mask_token_id", 103))
+
+    # max_seq_length used by pylate is (document_length - 1); the prefix
+    # token is inserted manually after [CLS] at position 1, bringing the
+    # final sequence length back up to document_length.
+    document_length = int(cfg["document_length"])
+    document_prefix_id = int(cfg["document_prefix_id"])
+    max_seq_minus_prefix = document_length - 1
+    skiplist = [int(s) for s in cfg["skiplist"]]
 
     compute_dtype = mx.float16 if dtype == "fp16" else mx.float32
     # Prefer a dtype-specific export sibling so we don't pay an astype on
@@ -450,13 +482,50 @@ def encode_docs_mlx(
 
     dim = cfg["projection_out"]
 
+    def tokenize_docs(texts: list[str]) -> dict:
+        """HF tokenize + manual `[D]` prefix insertion at position 1.
+
+        Returns a dict of torch tensors with the same shape contract as
+        pylate.ColBERT.tokenize(..., is_query=False) on the docs path:
+            input_ids:      [B, T] int64 with [CLS], [D]-prefix, body, [SEP], pad
+            attention_mask: [B, T] int64 with prefix attended (1)
+            token_type_ids: [B, T] int64 zeros
+        Byte-equal vs pylate when tokenizer.pad_token_id is set to [MASK].
+        """
+        import torch  # type: ignore
+        # pylate strips text before tokenizing (its own _first_module).
+        stripped = [str(s).strip() for s in texts]
+        enc = tokenizer(
+            stripped,
+            padding=True,
+            truncation="longest_first",
+            return_tensors="pt",
+            max_length=max_seq_minus_prefix,
+        )
+        ids = enc["input_ids"]
+        attn = enc["attention_mask"]
+        type_ids = enc.get("token_type_ids")
+        B = ids.size(0)
+        prefix = torch.full((B, 1), document_prefix_id, dtype=ids.dtype)
+        ids = torch.cat([ids[:, :1], prefix, ids[:, 1:]], dim=1)
+        attn = torch.cat(
+            [attn[:, :1], torch.full((B, 1), 1, dtype=attn.dtype), attn[:, 1:]], dim=1
+        )
+        if type_ids is None:
+            type_ids = torch.zeros_like(ids)
+        else:
+            type_ids = torch.cat(
+                [type_ids[:, :1], torch.zeros(B, 1, dtype=type_ids.dtype), type_ids[:, 1:]], dim=1
+            )
+        return {"input_ids": ids, "attention_mask": attn, "token_type_ids": type_ids}
+
     # Build the iteration order. Default: input order (range). When
     # sort_by_length is on, tokenize the full corpus once to learn per-doc
     # lengths, then sort indices ascending by length (np.argsort is stable
     # via kind='stable'). Output order is restored at the end via slot fill.
     n = len(docs)
     if sort_by_length and n > 1:
-        all_features = pl.tokenize([d["text"] for d in docs], is_query=False)
+        all_features = tokenize_docs([d["text"] for d in docs])
         # attention_mask sum per row gives unpadded token count.
         lengths = all_features["attention_mask"].sum(dim=1).cpu().numpy()
         order = np.argsort(lengths, kind="stable").tolist()
@@ -474,15 +543,10 @@ def encode_docs_mlx(
         batch = [docs[i] for i in batch_indices]
         texts = [d["text"] for d in batch]
         try:
-            features = pl.tokenize(texts, is_query=False)
+            features = tokenize_docs(texts)
             input_ids_pt = features["input_ids"]
             attn_pt = features["attention_mask"]
-            type_ids_pt = features.get("token_type_ids")
-            if type_ids_pt is None:
-                # If absent (some tokenizers), default to zeros.
-                import torch  # type: ignore
-
-                type_ids_pt = torch.zeros_like(input_ids_pt)
+            type_ids_pt = features["token_type_ids"]
 
             input_ids = mx.array(input_ids_pt.cpu().numpy().astype("int32"))
             attn = mx.array(attn_pt.cpu().numpy().astype("int32"))

@@ -214,6 +214,19 @@ def main() -> None:
             file=sys.stderr,
         )
 
+    # Capture pylate's tokenizer-side metadata so the MLX encoder can run
+    # without instantiating pylate.models.ColBERT at inference time.
+    # rec-01 (post-audit): the runtime pylate load was a fixed cost that
+    # buried the small-corpus speedup. With this metadata in config.json,
+    # encode_mlx.py uses AutoTokenizer + manual prefix insertion and
+    # produces byte-equal token_ids on the live fixture.
+    skiplist = sorted(int(s) for s in model.skiplist)
+    document_length = int(model.document_length)
+    query_length = int(model.query_length)
+    document_prefix_id = int(model.document_prefix_id)
+    query_prefix_id = int(model.query_prefix_id)
+    attend_to_expansion_tokens = bool(model.attend_to_expansion_tokens)
+
     # Walk + remap state_dict.
     sd = model.state_dict()
     out_weights: dict[str, mx.array] = {}
@@ -278,7 +291,7 @@ def main() -> None:
     mx.save_safetensors(str(safetensors_path), out_weights)
 
     config = {
-        "format_version": 1,
+        "format_version": 2,
         "model_name": args.model,
         "architecture": "bert-base",
         "n_layers": int(n_layers),
@@ -296,6 +309,16 @@ def main() -> None:
         "weight_dtype": args.dtype,
         "n_weights": len(out_weights),
         "discarded_keys": discarded,
+        # Tokenizer-side metadata so encode_mlx.py can avoid pylate at
+        # inference. The HuggingFace AutoTokenizer for `model_name` plus
+        # these fields fully reproduces pylate.ColBERT.tokenize for the
+        # docs path on byte-equal token_ids.
+        "skiplist": skiplist,
+        "document_length": document_length,
+        "query_length": query_length,
+        "document_prefix_id": document_prefix_id,
+        "query_prefix_id": query_prefix_id,
+        "attend_to_expansion_tokens": attend_to_expansion_tokens,
     }
     with config_path.open("w", encoding="utf-8") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
