@@ -541,3 +541,168 @@ test "fit: empty cluster re-seed with collinear pathological data" {
     defer r.deinit(testing.allocator);
     for (r.assignments) |a| try testing.expect(a < 3);
 }
+
+test "fit: returned centroids/assignments satisfy both Lloyd's invariants" {
+    // The centroid-consistency invariant: after fit() returns, the two paper
+    // §3 fixed-point conditions must hold simultaneously:
+    //   (1) for each point p: ‖p - centroids[assignments[p]]‖² is the
+    //       minimum over all centroids (assignments are argmin under
+    //       the returned centroids).
+    //   (2) for each cluster k that has ≥1 assigned point:
+    //       centroids[k] == mean({points where assignments == k})
+    //       (centroids are the means of the assigned points).
+    // Both invariants jointly characterise a Lloyd's fixed point. Pre-fix
+    // (convergence-after-update bug) invariant (2) failed on the early-break
+    // path because the loop returned `centroids_{t-1}` paired with
+    // `assignments_t` / `wcss_t`.
+    const a = std.testing.allocator;
+
+    // 5 well-separated 2D blobs, 8 points each → easy convergence in a
+    // handful of Lloyd iterations under any reasonable kmeans++ seeding.
+    const blob_centers = [_][2]f32{
+        .{ 0, 0 }, .{ 50, 0 }, .{ 0, 50 }, .{ -50, 0 }, .{ 0, -50 },
+    };
+    const offsets = [_][2]f32{
+        .{ -0.05, 0.02 },  .{ 0.03, -0.04 }, .{ -0.01, -0.02 }, .{ 0.02, 0.05 },
+        .{ -0.03, 0.01 },  .{ 0.04, -0.03 }, .{ 0.0, 0.0 },     .{ 0.01, -0.01 },
+    };
+    const dim: u32 = 2;
+    const n: usize = blob_centers.len * offsets.len;
+    const pts = try a.alloc(f32, n * dim);
+    defer a.free(pts);
+    var idx: usize = 0;
+    for (blob_centers) |bc| for (offsets) |off| {
+        pts[idx * 2 + 0] = bc[0] + off[0];
+        pts[idx * 2 + 1] = bc[1] + off[1];
+        idx += 1;
+    };
+
+    // Run with default tol so the early-break path is exercised (well-
+    // separated blobs converge well before max_iters).
+    var r = try fit(pts, dim, .{ .k = 5, .seed = 7, .max_iters = 50 }, a);
+    defer r.deinit(a);
+
+    const k: usize = 5;
+    const d: usize = dim;
+
+    // Invariant (1): assignments are argmin under returned centroids.
+    for (0..n) |i| {
+        const v_i = pts[i * d ..][0..d];
+        const a_i: usize = r.assignments[i];
+        const my_dist = try vec.l2sq(v_i, r.centroids[a_i * d ..][0..d]);
+        for (0..k) |cc| {
+            const cc_dist = try vec.l2sq(v_i, r.centroids[cc * d ..][0..d]);
+            // `my_dist` must be ≤ every other; allow exact ties.
+            try testing.expect(my_dist <= cc_dist);
+        }
+    }
+
+    // Invariant (2): centroids are the means of their assigned points.
+    // Recompute means in the same vector-order serial reduction the
+    // implementation uses, so the comparison stays bit-stable rather than
+    // floating-tolerant — that's the whole point of the fix.
+    const sums = try a.alloc(f32, k * d);
+    defer a.free(sums);
+    const counts = try a.alloc(u32, k);
+    defer a.free(counts);
+    @memset(sums, 0.0);
+    @memset(counts, 0);
+    for (0..n) |i| {
+        const cc: usize = r.assignments[i];
+        const v_i = pts[i * d ..][0..d];
+        const slot = sums[cc * d ..][0..d];
+        for (0..d) |dd| slot[dd] += v_i[dd];
+        counts[cc] += 1;
+    }
+    for (0..k) |cc| {
+        if (counts[cc] == 0) continue; // empty clusters are re-seeded; skip.
+        const inv: f32 = 1.0 / @as(f32, @floatFromInt(counts[cc]));
+        const expected = sums[cc * d ..][0..d];
+        const got = r.centroids[cc * d ..][0..d];
+        for (0..d) |dd| {
+            try testing.expectEqual(expected[dd] * inv, got[dd]);
+        }
+    }
+}
+
+test "fit: spawn-cleanup path joins on success without leaks across thread counts" {
+    // Black-box exercise of the spawn-cleanup path. We can't synthetically
+    // make `std.Thread.spawn` fail mid-loop without a platform-specific hook,
+    // so instead we (a) drive the parallel branch with a wide range of
+    // n_threads (including the n_threads > n clamp, which used to mask join
+    // bugs with one-shot tests), all under `testing.allocator` which panics
+    // on any leak — exercising the join-on-success arm — and (b) re-assert
+    // that for every thread count the run completes and produces internally
+    // consistent results. The matching join-on-spawn-failure arm in the
+    // source is structurally identical to src/index/hnsw.zig:865, which is
+    // separately covered by hnsw's tests; mirroring the pattern here keeps
+    // them in lock-step.
+    const a = std.testing.allocator;
+    const dim: u32 = 4;
+    const n: u32 = 64;
+    const buf = try a.alloc(f32, @as(usize, n) * @as(usize, dim));
+    defer a.free(buf);
+    var prng = std.Random.DefaultPrng.init(0xCAFE);
+    for (buf) |*x| x.* = prng.random().floatNorm(f32);
+
+    var r1 = try fit(buf, dim, .{ .k = 8, .seed = 99, .n_threads = 1 }, a);
+    defer r1.deinit(a);
+
+    // Including counts that exceed `n` (clamped internally) — the pre-fix
+    // code path had a latent bug where a partial spawn-loop could orphan
+    // threads on failure; the new pattern joins only `spawned` entries.
+    inline for (.{ 2, 3, 4, 8, 16, 64, 256 }) |t_count| {
+        var r = try fit(buf, dim, .{
+            .k = 8,
+            .seed = 99,
+            .n_threads = @as(u32, t_count),
+        }, a);
+        defer r.deinit(a);
+        try testing.expectEqualSlices(f32, r1.centroids, r.centroids);
+        try testing.expectEqualSlices(u32, r1.assignments, r.assignments);
+    }
+}
+
+test "fit: convergence early-break still produces invariant-consistent state" {
+    // Targeted regression test for the pre-fix order: contrive a fixture
+    // where rel_delta < tol triggers in the second Lloyd iteration, so the
+    // early-break code path is the one being exercised. The recovered
+    // centroids must equal mean(assignments) — pre-fix this failed.
+    const a = std.testing.allocator;
+
+    // Two tight, well-separated blobs → kmeans++ seeds them perfectly on
+    // iter 0; iter 1's WCSS is essentially identical → break under default
+    // tol = 1e-4.
+    const dim: u32 = 2;
+    const n: usize = 12;
+    const pts = [_]f32{
+        // blob A near (0, 0)
+        0.00, 0.00, 0.01, -0.01, -0.02, 0.01, 0.01, 0.02, -0.01, -0.02, 0.00, 0.01,
+        // blob B near (100, 100)
+        100.0, 100.0, 99.99, 100.01, 100.02, 99.98, 100.01, 99.99, 99.98, 100.02, 100.0, 100.0,
+    };
+
+    var r = try fit(&pts, dim, .{ .k = 2, .seed = 3, .max_iters = 25 }, a);
+    defer r.deinit(a);
+
+    // Should converge fast (early break path active).
+    try testing.expect(r.iters_run <= 5);
+
+    // means invariant: bit-stable equality with serial recomputation.
+    const k: usize = 2;
+    const d: usize = dim;
+    var sums: [k * d]f32 = .{ 0.0, 0.0, 0.0, 0.0 };
+    var counts: [k]u32 = .{ 0, 0 };
+    for (0..n) |i| {
+        const cc: usize = r.assignments[i];
+        const slot = sums[cc * d ..][0..d];
+        for (0..d) |dd| slot[dd] += pts[i * d + dd];
+        counts[cc] += 1;
+    }
+    for (0..k) |cc| {
+        try testing.expect(counts[cc] > 0);
+        const inv: f32 = 1.0 / @as(f32, @floatFromInt(counts[cc]));
+        try testing.expectEqual(sums[cc * d + 0] * inv, r.centroids[cc * d + 0]);
+        try testing.expectEqual(sums[cc * d + 1] * inv, r.centroids[cc * d + 1]);
+    }
+}
