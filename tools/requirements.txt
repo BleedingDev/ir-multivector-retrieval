@@ -1,0 +1,14 @@
+# tools/requirements.txt — Python dependencies for tools/encode.py.
+#
+# Owner: primitives-engineer.
+# Pinned ranges, not exact versions, so the encoder picks up bugfixes
+# without breaking the format. Bump pins deliberately when upgrading the
+# encoder model.
+
+pylate>=1.1,<2.0
+torch>=2.2,<3.0
+
+# Transitive but worth pinning loosely so we don't end up on something
+# pylate hasn't validated against.
+transformers>=4.40,<5.0
+sentence-transformers>=3.0,<4.0
