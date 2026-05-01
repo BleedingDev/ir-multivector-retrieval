@@ -16,8 +16,15 @@ pub const PruneParams = struct {
     alpha: ?f32 = null,
 };
 
+/// Descending-by-score comparator with ascending `doc_id` as a deterministic
+/// secondary key. The secondary key matters because `std.sort.pdq` is not a
+/// stable sort: equal-score candidates can otherwise reorder run-to-run
+/// depending on input layout. Pinning ties to `doc_id` makes pruned output
+/// bytewise reproducible across input shuffles, which is what every test
+/// (and the paper §9 byte-equality story) relies on.
 fn cmpDesc(_: void, a: gather.Candidate, b: gather.Candidate) bool {
-    return a.score > b.score;
+    if (a.score != b.score) return a.score > b.score;
+    return a.doc_id < b.doc_id;
 }
 
 /// Mutate `candidates` in-place: sort descending by score and truncate to
@@ -39,14 +46,25 @@ fn cmpDesc(_: void, a: gather.Candidate, b: gather.Candidate) bool {
 /// to a single-pass cutoff: walk until the first score < threshold, drop
 /// the rest. Deterministic at every (κ_d, α). Cross-check vs the reference
 /// Rust impl tracked in plan 06.
+///
+/// CP guard: when `top <= 0` (e.g. every candidate has a non-positive score
+/// for an out-of-domain query, or a synthetic test corner) the
+/// `alpha * top` threshold inverts — for negative `top`, multiplying by
+/// `α ∈ (0, 1)` gives a *larger* number, so `score < threshold` would be
+/// true for every entry and CP would discard everything. That's never what
+/// the user wants: the contract is "prune the tail", not "drop the head".
+/// In that regime we skip CP entirely and fall back to top-κ_d, leaving at
+/// least the best candidates available to refine. Equivalent to treating
+/// `α` as undefined when the running max is non-positive.
 pub fn prune(candidates: []gather.Candidate, params: PruneParams) []gather.Candidate {
     if (candidates.len == 0 or params.kappa_d == 0) return candidates[0..0];
 
-    // Stage 1 — descending sort by score. pdq is O(n log n) with tiny
-    // constants and is deterministic across runs; quickselect to κ_d would
-    // shave a log factor but the gather output is bounded by candidate
-    // counts in the tens of thousands on MS MARCO @ κ_c=80, well within
-    // budget. Revisit if the latency harness shows prune dominating.
+    // Stage 1 — descending sort by score, ascending doc_id on ties. pdq is
+    // O(n log n) with tiny constants and is deterministic across runs;
+    // quickselect to κ_d would shave a log factor but the gather output is
+    // bounded by candidate counts in the tens of thousands on MS MARCO @
+    // κ_c=80, well within budget. Revisit if the latency harness shows
+    // prune dominating.
     std.sort.pdq(gather.Candidate, candidates, {}, cmpDesc);
 
     var keep: usize = @min(candidates.len, @as(usize, params.kappa_d));
@@ -54,16 +72,20 @@ pub fn prune(candidates: []gather.Candidate, params: PruneParams) []gather.Candi
     // Stage 2 — adaptive Candidates Pruning.
     if (params.alpha) |a| {
         const top = candidates[0].score;
-        const threshold = a * top;
-        var cut: usize = keep;
-        var i: usize = 0;
-        while (i < keep) : (i += 1) {
-            if (candidates[i].score < threshold) {
-                cut = i;
-                break;
+        // Guard: see doc-comment above. CP is only well-defined when the
+        // running max is positive; otherwise skip it and keep top-κ_d.
+        if (top > 0) {
+            const threshold = a * top;
+            var cut: usize = keep;
+            var i: usize = 0;
+            while (i < keep) : (i += 1) {
+                if (candidates[i].score < threshold) {
+                    cut = i;
+                    break;
+                }
             }
+            keep = cut;
         }
-        keep = cut;
     }
 
     return candidates[0..keep];
@@ -209,4 +231,84 @@ test "prune: stable across input shuffles — same surviving doc IDs (in score o
         try testing.expectEqual(x.doc_id, y.doc_id);
         try testing.expectEqual(x.score, y.score);
     }
+}
+
+test "prune: tied scores break by ascending doc_id deterministically" {
+    // Five candidates with the same score; after sort the order must be by
+    // ascending doc_id regardless of input order, because pdq is unstable.
+    var buf: [5]gather.Candidate = .{
+        .{ .doc_id = 42, .score = 1.0 },
+        .{ .doc_id = 7, .score = 1.0 },
+        .{ .doc_id = 99, .score = 1.0 },
+        .{ .doc_id = 3, .score = 1.0 },
+        .{ .doc_id = 17, .score = 1.0 },
+    };
+    const out = prune(buf[0..], .{ .kappa_d = 5 });
+    try testing.expectEqual(@as(usize, 5), out.len);
+    try testing.expectEqual(@as(u32, 3), out[0].doc_id);
+    try testing.expectEqual(@as(u32, 7), out[1].doc_id);
+    try testing.expectEqual(@as(u32, 17), out[2].doc_id);
+    try testing.expectEqual(@as(u32, 42), out[3].doc_id);
+    try testing.expectEqual(@as(u32, 99), out[4].doc_id);
+}
+
+test "prune: tie-break is deterministic across input shuffles when scores tie" {
+    // 16 candidates with only 4 distinct scores → many ties. The kappa_d=8
+    // cut must select the same doc_ids regardless of input layout.
+    var buf_orig: [16]gather.Candidate = undefined;
+    var buf_shuf: [16]gather.Candidate = undefined;
+    var i: u32 = 0;
+    while (i < 16) : (i += 1) {
+        const s: f32 = @as(f32, @floatFromInt(i % 4)); // 0,1,2,3,0,1,2,3,...
+        buf_orig[i] = .{ .doc_id = i, .score = s };
+        buf_shuf[i] = .{ .doc_id = i, .score = s };
+    }
+    var rng = std.Random.DefaultPrng.init(0xdeadbeef);
+    rng.random().shuffle(gather.Candidate, &buf_shuf);
+
+    const a = prune(buf_orig[0..], .{ .kappa_d = 8 });
+    const b = prune(buf_shuf[0..], .{ .kappa_d = 8 });
+    try testing.expectEqual(a.len, b.len);
+    for (a, b) |x, y| {
+        try testing.expectEqual(x.doc_id, y.doc_id);
+        try testing.expectEqual(x.score, y.score);
+    }
+}
+
+test "prune: CP guard — all-negative scores keeps top-κ_d instead of dropping everything" {
+    // Without the guard, top=-1.0 and α=0.5 give threshold=-0.5, which is
+    // larger than every score, so CP would drop the entire candidate list.
+    // With the guard, CP is skipped and top-κ_d returns intact.
+    var buf: [5]gather.Candidate = undefined;
+    const cands = makeCands(&buf, &.{ -3.0, -1.0, -2.0, -5.0, -4.0 });
+    const out = prune(cands, .{ .kappa_d = 100, .alpha = 0.5 });
+    try testing.expectEqual(@as(usize, 5), out.len);
+    // Sort still applied: descending by score (least-negative first).
+    try testing.expectEqual(@as(f32, -1.0), out[0].score);
+    try testing.expectEqual(@as(f32, -2.0), out[1].score);
+    try testing.expectEqual(@as(f32, -3.0), out[2].score);
+    try testing.expectEqual(@as(f32, -4.0), out[3].score);
+    try testing.expectEqual(@as(f32, -5.0), out[4].score);
+}
+
+test "prune: CP guard — top exactly 0 also skips CP (no divide-by-zero corner)" {
+    // top=0 → threshold=0, score < 0 trivially drops every negative entry.
+    // The guard's `top > 0` check means we skip CP and return top-κ_d.
+    var buf: [4]gather.Candidate = undefined;
+    const cands = makeCands(&buf, &.{ 0.0, -1.0, -2.0, -3.0 });
+    const out = prune(cands, .{ .kappa_d = 100, .alpha = 0.5 });
+    try testing.expectEqual(@as(usize, 4), out.len);
+    try testing.expectEqual(@as(f32, 0.0), out[0].score);
+}
+
+test "prune: CP guard — mixed-sign scores with positive top still applies CP" {
+    // Sanity: the guard only triggers when top <= 0. With a positive top,
+    // CP runs normally even if the tail is negative.
+    var buf: [5]gather.Candidate = undefined;
+    const cands = makeCands(&buf, &.{ 10.0, 6.0, 1.0, -2.0, -5.0 });
+    const out = prune(cands, .{ .kappa_d = 100, .alpha = 0.5 });
+    // top=10, threshold=5, keep scores >= 5: {10, 6}.
+    try testing.expectEqual(@as(usize, 2), out.len);
+    try testing.expectEqual(@as(f32, 10.0), out[0].score);
+    try testing.expectEqual(@as(f32, 6.0), out[1].score);
 }

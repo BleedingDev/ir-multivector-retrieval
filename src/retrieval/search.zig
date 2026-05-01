@@ -34,8 +34,15 @@ pub const SearchError = error{
     TopKExceedsKappaD,
 } || gather.GatherError || pq_mod.PqError || refine.RefineError;
 
+/// Descending-by-score comparator with ascending `doc_id` as a deterministic
+/// secondary key. Without the secondary key, `std.sort.pdq` (unstable) can
+/// reorder ties run-to-run, which would surface as flaky top-`top_k` output
+/// when refine produces identical exact-MaxSim scores for several
+/// candidates. Tied doc_ids cannot collide because gather de-duplicates
+/// candidates per query.
 fn cmpDescScored(_: void, a: ScoredDoc, b: ScoredDoc) bool {
-    return a.score > b.score;
+    if (a.score != b.score) return a.score > b.score;
+    return a.doc_id < b.doc_id;
 }
 
 /// Run the full paper §5 retrieval pipeline.
@@ -44,9 +51,10 @@ fn cmpDescScored(_: void, a: ScoredDoc, b: ScoredDoc) bool {
 /// by exact MaxSim. Caller frees with `gpa.free(result)`.
 ///
 /// Determinism: gather emits the same candidate set for a given query/index;
-/// prune sorts deterministically; refine is pure; final sort uses strict `>`
-/// so equal-score ties keep input order. Sticky doc-id tie-breaks would
-/// need a secondary key — defer until benchmarks reveal a need.
+/// prune sorts deterministically (score desc, doc_id asc on ties); refine is
+/// pure; the final sort here uses the same descending-score / ascending-
+/// doc_id comparator so the top-`top_k` cut is reproducible across runs and
+/// across candidate input layouts.
 pub fn search(
     index: *const storage.Index,
     query_tokens: []const f32,
@@ -261,4 +269,45 @@ test "search: kappa_d > total candidates returns full sorted set up to top_k" {
     defer gpa.free(result);
 
     try testing.expect(result.len <= 5);
+}
+
+test "cmpDescScored: ties on score break by ascending doc_id" {
+    // Direct test of the ScoredDoc comparator. We pdq-sort an array with
+    // many equal scores in random order — without the doc_id tie-break,
+    // pdq's instability would let the order drift.
+    var arr_a: [10]ScoredDoc = .{
+        .{ .doc_id = 9, .score = 1.0 }, .{ .doc_id = 1, .score = 1.0 },
+        .{ .doc_id = 5, .score = 1.0 }, .{ .doc_id = 3, .score = 1.0 },
+        .{ .doc_id = 7, .score = 1.0 }, .{ .doc_id = 0, .score = 1.0 },
+        .{ .doc_id = 8, .score = 1.0 }, .{ .doc_id = 2, .score = 1.0 },
+        .{ .doc_id = 6, .score = 1.0 }, .{ .doc_id = 4, .score = 1.0 },
+    };
+    var arr_b: [10]ScoredDoc = .{
+        .{ .doc_id = 4, .score = 1.0 }, .{ .doc_id = 6, .score = 1.0 },
+        .{ .doc_id = 2, .score = 1.0 }, .{ .doc_id = 8, .score = 1.0 },
+        .{ .doc_id = 0, .score = 1.0 }, .{ .doc_id = 7, .score = 1.0 },
+        .{ .doc_id = 3, .score = 1.0 }, .{ .doc_id = 5, .score = 1.0 },
+        .{ .doc_id = 1, .score = 1.0 }, .{ .doc_id = 9, .score = 1.0 },
+    };
+    std.sort.pdq(ScoredDoc, &arr_a, {}, cmpDescScored);
+    std.sort.pdq(ScoredDoc, &arr_b, {}, cmpDescScored);
+    var i: u32 = 0;
+    while (i < 10) : (i += 1) {
+        try testing.expectEqual(@as(u32, i), arr_a[i].doc_id);
+        try testing.expectEqual(@as(u32, i), arr_b[i].doc_id);
+    }
+}
+
+test "cmpDescScored: distinct scores still ordered by score desc" {
+    var arr: [4]ScoredDoc = .{
+        .{ .doc_id = 1, .score = 0.5 },
+        .{ .doc_id = 2, .score = 1.5 },
+        .{ .doc_id = 3, .score = 0.1 },
+        .{ .doc_id = 4, .score = 1.0 },
+    };
+    std.sort.pdq(ScoredDoc, &arr, {}, cmpDescScored);
+    try testing.expectEqual(@as(f32, 1.5), arr[0].score);
+    try testing.expectEqual(@as(f32, 1.0), arr[1].score);
+    try testing.expectEqual(@as(f32, 0.5), arr[2].score);
+    try testing.expectEqual(@as(f32, 0.1), arr[3].score);
 }
