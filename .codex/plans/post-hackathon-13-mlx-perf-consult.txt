@@ -1,0 +1,3024 @@
+Reading prompt from stdin...
+OpenAI Codex v0.128.0 (research preview)
+--------
+workdir: /Users/satan/side/experiments/ir-multivector-retrieval
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR, /Users/satan/.codex/memories]
+reasoning effort: high
+reasoning summaries: none
+session id: 019de4ef-f82b-71b3-9aae-3b8dfcdf501a
+--------
+user
+You are reviewing a freshly-landed MLX (Apple Silicon native) port of a ColBERT encoder. The port is parity-correct (cosine 0.999999 mean / 0.999873 min vs PyTorch fp16 on 100 docs, byte-deterministic across runs). Measured speedup is 1.44× on 100-doc fixture but **3.47× fp32 / 4.19× fp16** on a 1000-doc Jira workload. That gap suggests we're losing real wins to fixed costs and/or sub-optimal hot-path code.
+
+The user wants to "squeeze out more" — give concrete, actionable optimization opportunities, prioritized by expected ROI.
+
+Repo: /Users/satan/side/experiments/ir-multivector-retrieval (Apple M-series, MLX 0.18+, Python 3.x).
+Key files (please READ them before recommending):
+- tools/encode_mlx.py — the MLX BERT-base forward pass, ~497 lines
+- tools/export_colbert_to_mlx.py — weight conversion
+- tools/_tokens_bin.py — shared output writer
+- tests/live/mlx_parity.py — 4-gate parity harness with measured numbers
+- tools/LIVE_ENCODER_NOTES.md — current findings + perf table
+- tools/encode.py — the PyTorch baseline for comparison
+
+Focus areas:
+1. Is the MLX forward pass missing standard Apple-Silicon wins (flash-attention via `mx.fast.scaled_dot_product_attention`, bf16 path, kernel fusion, eager-vs-lazy compilation)?
+2. Is there pipeline parallelism left on the table (CPU tokenization overlapped with GPU forward; prefetching next batch during current forward)?
+3. Are there padding/batching strategies that would reduce fixed overhead and bring the small-corpus speedup up from 1.4× toward the 4× ceiling?
+4. Spot-checks on the parity test rigor — anything missing that would let us claim "drop-in replacement" with more confidence?
+5. Anything suspicious in the BERT layer implementation that's leaving cycles on the floor (manual softmax instead of fused, redundant reshapes, etc.)?
+
+DO NOT propose architectural rewrites. DO propose specific, measurable changes with rough effort/payoff estimates. Be concrete: cite line numbers, name the function, show the diff shape.
+
+Output format: 5-10 prioritized recommendations. For each: name, file:line evidence, what to change, expected wall-clock impact (optimistic/realistic), implementation effort (S/M/L), and a 1-sentence rationale. End with a recommended ordering.
+
+Be honest if any current choice is already optimal — do not invent wins.
+
+codex
+I’ll read the encoder, parity harness, notes, writer, converter, and PyTorch baseline first, then ground the recommendations in exact call sites and measured behavior.
+exec
+/bin/zsh -lc "nl -ba tools/encode_mlx.py | sed -n '1,260p'" in /Users/satan/side/experiments/ir-multivector-retrieval
+ succeeded in 0ms:
+     1	#!/usr/bin/env python3
+     2	"""tools/encode_mlx.py — MLX (Apple Silicon native) port of tools/encode.py.
+     3	
+     4	Owner: post-hackathon plan-12 (mlx-encoder-engineer).
+     5	
+     6	EXPERIMENTAL until the 4-gate parity contract in
+     7	`tests/live/mlx_parity.py` is green.
+     8	
+     9	Reuses the HuggingFace tokenizer via pylate's `model.tokenize` (HF
+    10	tokenizers are deterministic CPU code, fast, and the only way to get
+    11	byte-equal token_ids). Implements the BERT base forward pass directly in
+    12	mlx.nn (no mlx_lm BERT class today). Outputs the same tokens.bin v2
+    13	format via the shared writer in tools/_tokens_bin.py.
+    14	
+    15	Usage:
+    16	    tools/.venv/bin/python tools/encode_mlx.py \\
+    17	        --docs   tests/fixtures/live/docs.jsonl \\
+    18	        --out    /tmp/parity_mlx.bin \\
+    19	        --model  colbert-ir/colbertv2.0 \\
+    20	        --weights tools/.cache/colbert-ir__colbertv2.0/mlx_weights.safetensors \\
+    21	        --dtype  fp16
+    22	
+    23	Run tools/export_colbert_to_mlx.py first to produce the safetensors file.
+    24	"""
+    25	from __future__ import annotations
+    26	
+    27	import argparse
+    28	import json
+    29	import sys
+    30	from pathlib import Path
+    31	
+    32	# Re-use the shared writer from encode.py's refactor (Phase B).
+    33	sys.path.insert(0, str(Path(__file__).resolve().parent))
+    34	from _tokens_bin import EncodedDoc, write_metadata as _write_metadata_shared, write_tokens_bin
+    35	
+    36	import mlx.core as mx
+    37	import mlx.nn as nn
+    38	
+    39	
+    40	def parse_args() -> argparse.Namespace:
+    41	    p = argparse.ArgumentParser(
+    42	        description="MLX-native ColBERT encoder (parity-tested companion to encode.py)"
+    43	    )
+    44	    p.add_argument("--docs", type=Path, required=True, help="path to docs.jsonl")
+    45	    p.add_argument("--out", type=Path, required=True, help="output tokens.bin path")
+    46	    p.add_argument(
+    47	        "--model",
+    48	        type=str,
+    49	        default="colbert-ir/colbertv2.0",
+    50	        help="ColBERT model name (HuggingFace ID or local path); used for tokenizer + skiplist",
+    51	    )
+    52	    p.add_argument(
+    53	        "--weights",
+    54	        type=Path,
+    55	        default=None,
+    56	        help=(
+    57	            "MLX safetensors file produced by tools/export_colbert_to_mlx.py. "
+    58	            "Defaults to tools/.cache/<safe_model>/mlx_weights.safetensors. "
+    59	            "config.json must sit next to it."
+    60	        ),
+    61	    )
+    62	    p.add_argument(
+    63	        "--dtype",
+    64	        choices=("fp32", "fp16"),
+    65	        default="fp16",
+    66	        help="MLX compute dtype. fp16 default to mirror encode.py's MPS default.",
+    67	    )
+    68	    p.add_argument(
+    69	        "--batch", type=int, default=32, help="docs per forward pass batch"
+    70	    )
+    71	    p.add_argument(
+    72	        "--max-docs", type=int, default=None, help="optional cap (smoke testing)"
+    73	    )
+    74	    p.add_argument(
+    75	        "--trust-remote-code",
+    76	        action="store_true",
+    77	        help="pass through to pylate.models.ColBERT for tokenizer load (jina models)",
+    78	    )
+    79	    p.add_argument(
+    80	        "--meta-out",
+    81	        type=Path,
+    82	        default=None,
+    83	        help="sidecar metadata path; defaults to <out>.meta.json",
+    84	    )
+    85	    return p.parse_args()
+    86	
+    87	
+    88	# ---------------------------------------------------------------------------
+    89	# BERT-base forward in MLX
+    90	# ---------------------------------------------------------------------------
+    91	
+    92	
+    93	class BertSelfAttention(nn.Module):
+    94	    """Multi-head self-attention block matching HF BertSelfAttention's
+    95	    weight layout exactly. q/k/v are separate Linear layers (HF stores
+    96	    them split, not as a fused QKV)."""
+    97	
+    98	    def __init__(self, hidden: int, n_heads: int):
+    99	        super().__init__()
+   100	        if hidden % n_heads != 0:
+   101	            raise SystemExit(f"hidden {hidden} not divisible by n_heads {n_heads}")
+   102	        self.n_heads = n_heads
+   103	        self.head_dim = hidden // n_heads
+   104	        self.q = nn.Linear(hidden, hidden)
+   105	        self.k = nn.Linear(hidden, hidden)
+   106	        self.v = nn.Linear(hidden, hidden)
+   107	        self.out = nn.Linear(hidden, hidden)
+   108	        self.ln = nn.LayerNorm(hidden)
+   109	
+   110	    def __call__(self, x: mx.array, attn_bias: mx.array) -> mx.array:
+   111	        B, T, H = x.shape
+   112	        n = self.n_heads
+   113	        d = self.head_dim
+   114	        scale = 1.0 / (d ** 0.5)
+   115	
+   116	        q = self.q(x).reshape(B, T, n, d).transpose(0, 2, 1, 3)  # [B,n,T,d]
+   117	        k = self.k(x).reshape(B, T, n, d).transpose(0, 2, 1, 3)
+   118	        v = self.v(x).reshape(B, T, n, d).transpose(0, 2, 1, 3)
+   119	
+   120	        # scores [B, n, T, T]
+   121	        scores = (q @ k.transpose(0, 1, 3, 2)) * scale
+   122	        scores = scores + attn_bias  # broadcast [B,1,1,T]
+   123	        attn = mx.softmax(scores, axis=-1)
+   124	        ctx = attn @ v  # [B, n, T, d]
+   125	        ctx = ctx.transpose(0, 2, 1, 3).reshape(B, T, H)
+   126	
+   127	        # output projection + residual + LN (BERT post-LN)
+   128	        return self.ln(self.out(ctx) + x)
+   129	
+   130	
+   131	class BertFFN(nn.Module):
+   132	    """Position-wise FFN: up-project (gelu) → down-project → residual + LN."""
+   133	
+   134	    def __init__(self, hidden: int, intermediate: int):
+   135	        super().__init__()
+   136	        self.up = nn.Linear(hidden, intermediate)
+   137	        self.down = nn.Linear(intermediate, hidden)
+   138	        self.ln = nn.LayerNorm(hidden)
+   139	
+   140	    def __call__(self, x: mx.array) -> mx.array:
+   141	        h = self.up(x)
+   142	        h = nn.gelu(h)
+   143	        h = self.down(h)
+   144	        return self.ln(h + x)
+   145	
+   146	
+   147	class BertLayer(nn.Module):
+   148	    def __init__(self, hidden: int, n_heads: int, intermediate: int):
+   149	        super().__init__()
+   150	        self.attn = BertSelfAttention(hidden, n_heads)
+   151	        self.ff = BertFFN(hidden, intermediate)
+   152	
+   153	    def __call__(self, x: mx.array, attn_bias: mx.array) -> mx.array:
+   154	        x = self.attn(x, attn_bias)
+   155	        x = self.ff(x)
+   156	        return x
+   157	
+   158	
+   159	class BertEmbeddings(nn.Module):
+   160	    def __init__(self, vocab: int, max_pos: int, type_vocab: int, hidden: int):
+   161	        super().__init__()
+   162	        self.word = nn.Embedding(vocab, hidden)
+   163	        self.position = nn.Embedding(max_pos, hidden)
+   164	        self.token_type = nn.Embedding(type_vocab, hidden)
+   165	        self.ln = nn.LayerNorm(hidden)
+   166	
+   167	    def __call__(self, input_ids: mx.array, token_type_ids: mx.array) -> mx.array:
+   168	        T = input_ids.shape[1]
+   169	        pos_ids = mx.arange(T, dtype=mx.int32)
+   170	        # broadcast pos_ids over batch
+   171	        x = self.word(input_ids) + self.position(pos_ids) + self.token_type(token_type_ids)
+   172	        return self.ln(x)
+   173	
+   174	
+   175	class ColBertMLX(nn.Module):
+   176	    """BERT base + final linear projection (no bias) + optional L2-normalize.
+   177	    Forward returns the per-token L2-normalised projected embeddings."""
+   178	
+   179	    def __init__(self, cfg: dict):
+   180	        super().__init__()
+   181	        self.cfg = cfg
+   182	        self.embeddings = BertEmbeddings(
+   183	            vocab=cfg["vocab_size"],
+   184	            max_pos=cfg["max_position_embeddings"],
+   185	            type_vocab=cfg["type_vocab_size"],
+   186	            hidden=cfg["hidden_size"],
+   187	        )
+   188	        self.layers = [
+   189	            BertLayer(
+   190	                hidden=cfg["hidden_size"],
+   191	                n_heads=cfg["n_heads"],
+   192	                intermediate=cfg["intermediate_size"],
+   193	            )
+   194	            for _ in range(cfg["n_layers"])
+   195	        ]
+   196	        self.projection = nn.Linear(
+   197	            cfg["projection_in"], cfg["projection_out"], bias=cfg["projection_has_bias"]
+   198	        )
+   199	
+   200	    def __call__(
+   201	        self,
+   202	        input_ids: mx.array,
+   203	        attention_mask: mx.array,
+   204	        token_type_ids: mx.array,
+   205	    ) -> mx.array:
+   206	        # attention bias: 0 where mask=1, -inf where mask=0 (so softmax→0).
+   207	        # shape: [B, 1, 1, T] to broadcast over (n_heads, query_seq).
+   208	        bias = (1.0 - attention_mask.astype(input_ids.dtype)).astype(mx.float32) * -1e4
+   209	        bias = bias.reshape(bias.shape[0], 1, 1, bias.shape[1])
+   210	
+   211	        x = self.embeddings(input_ids, token_type_ids)
+   212	        # Cast bias to x's dtype so attention math stays in compute precision.
+   213	        bias = bias.astype(x.dtype)
+   214	
+   215	        for layer in self.layers:
+   216	            x = layer(x, bias)
+   217	
+   218	        # 768 -> 128 projection
+   219	        x = self.projection(x)
+   220	        # L2-normalize per token along last axis
+   221	        norm = mx.sqrt(mx.sum(x * x, axis=-1, keepdims=True) + 1e-12)
+   222	        return x / norm
+   223	
+   224	
+   225	def _load_weights_into_model(model: ColBertMLX, weights: dict) -> None:
+   226	    """Bind the flat safetensors dict produced by export_colbert_to_mlx.py
+   227	    into the MLX module tree."""
+   228	    # Build params tree matching mlx.nn's expected layout.
+   229	    params = {
+   230	        "embeddings": {
+   231	            "word": {"weight": weights["embeddings.word.weight"]},
+   232	            "position": {"weight": weights["embeddings.position.weight"]},
+   233	            "token_type": {"weight": weights["embeddings.token_type.weight"]},
+   234	            "ln": {
+   235	                "weight": weights["embeddings.ln.weight"],
+   236	                "bias": weights["embeddings.ln.bias"],
+   237	            },
+   238	        },
+   239	        "layers": [],
+   240	        "projection": {"weight": weights["projection.weight"]},
+   241	    }
+   242	    if "projection.bias" in weights:
+   243	        params["projection"]["bias"] = weights["projection.bias"]
+   244	
+   245	    n_layers = model.cfg["n_layers"]
+   246	    for i in range(n_layers):
+   247	        params["layers"].append(
+   248	            {
+   249	                "attn": {
+   250	                    "q": {
+   251	                        "weight": weights[f"layers.{i}.attn.q.weight"],
+   252	                        "bias": weights[f"layers.{i}.attn.q.bias"],
+   253	                    },
+   254	                    "k": {
+   255	                        "weight": weights[f"layers.{i}.attn.k.weight"],
+   256	                        "bias": weights[f"layers.{i}.attn.k.bias"],
+   257	                    },
+   258	                    "v": {
+   259	                        "weight": weights[f"layers.{i}.attn.v.weight"],
+   260	                        "bias": weights[f"layers.{i}.attn.v.bias"],
+
+exec
+/bin/zsh -lc "nl -ba tools/encode_mlx.py | sed -n '261,560p'" in /Users/satan/side/experiments/ir-multivector-retrieval
+ succeeded in 0ms:
+   261	                    },
+   262	                    "out": {
+   263	                        "weight": weights[f"layers.{i}.attn.out.weight"],
+   264	                        "bias": weights[f"layers.{i}.attn.out.bias"],
+   265	                    },
+   266	                    "ln": {
+   267	                        "weight": weights[f"layers.{i}.attn.ln.weight"],
+   268	                        "bias": weights[f"layers.{i}.attn.ln.bias"],
+   269	                    },
+   270	                },
+   271	                "ff": {
+   272	                    "up": {
+   273	                        "weight": weights[f"layers.{i}.ff.up.weight"],
+   274	                        "bias": weights[f"layers.{i}.ff.up.bias"],
+   275	                    },
+   276	                    "down": {
+   277	                        "weight": weights[f"layers.{i}.ff.down.weight"],
+   278	                        "bias": weights[f"layers.{i}.ff.down.bias"],
+   279	                    },
+   280	                    "ln": {
+   281	                        "weight": weights[f"layers.{i}.ff.ln.weight"],
+   282	                        "bias": weights[f"layers.{i}.ff.ln.bias"],
+   283	                    },
+   284	                },
+   285	            }
+   286	        )
+   287	
+   288	    model.update(params)
+   289	
+   290	
+   291	# ---------------------------------------------------------------------------
+   292	# Pipeline
+   293	# ---------------------------------------------------------------------------
+   294	
+   295	
+   296	def read_docs_jsonl(path: Path, max_docs: int | None) -> list[dict]:
+   297	    out: list[dict] = []
+   298	    with path.open("r", encoding="utf-8") as f:
+   299	        for lineno, line in enumerate(f, start=1):
+   300	            line = line.strip()
+   301	            if not line:
+   302	                continue
+   303	            try:
+   304	                obj = json.loads(line)
+   305	            except json.JSONDecodeError as e:
+   306	                raise SystemExit(f"{path}:{lineno}: malformed JSON: {e}") from e
+   307	            if "doc_id" not in obj or "text" not in obj:
+   308	                raise SystemExit(
+   309	                    f"{path}:{lineno}: each line needs 'doc_id' and 'text' fields"
+   310	                )
+   311	            out.append(obj)
+   312	            if max_docs is not None and len(out) >= max_docs:
+   313	                break
+   314	    return out
+   315	
+   316	
+   317	def encode_docs_mlx(
+   318	    docs: list[dict],
+   319	    *,
+   320	    model_name: str,
+   321	    weights_path: Path,
+   322	    dtype: str,
+   323	    batch_size: int,
+   324	    trust_remote_code: bool,
+   325	) -> tuple[list[EncodedDoc], list[tuple[str, str]], int]:
+   326	    """Encode docs through MLX. Returns (encoded, dropped, dim).
+   327	
+   328	    Tokenizer + skiplist come from pylate (CPU, deterministic, fast).
+   329	    Forward pass + L2-norm run in MLX. Output rows match the keep-mask
+   330	    (skiplist & attention_mask), exactly as encode.py does.
+   331	    """
+   332	    # Tokenizer comes from pylate. We don't run model.forward through pylate
+   333	    # — only model.tokenize and model.skiplist_mask.
+   334	    from pylate import models  # type: ignore
+   335	
+   336	    pl = models.ColBERT(
+   337	        model_name_or_path=model_name,
+   338	        trust_remote_code=trust_remote_code,
+   339	        device="cpu",
+   340	    )
+   341	    pl.eval()
+   342	    skiplist = pl.skiplist  # list[int]
+   343	
+   344	    # Read MLX safetensors + config.
+   345	    if not weights_path.exists():
+   346	        raise SystemExit(
+   347	            f"weights file {weights_path} missing — run tools/export_colbert_to_mlx.py first"
+   348	        )
+   349	    config_path = weights_path.parent / "config.json"
+   350	    if not config_path.exists():
+   351	        raise SystemExit(f"config.json missing next to {weights_path}")
+   352	    cfg = json.loads(config_path.read_text(encoding="utf-8"))
+   353	
+   354	    weights = mx.load(str(weights_path))
+   355	    compute_dtype = mx.float16 if dtype == "fp16" else mx.float32
+   356	    # Cast weights to compute dtype so the forward pass is consistent.
+   357	    weights = {k: v.astype(compute_dtype) for k, v in weights.items()}
+   358	
+   359	    model = ColBertMLX(cfg)
+   360	    _load_weights_into_model(model, weights)
+   361	    model.eval()
+   362	
+   363	    skip_set = set(int(s) for s in skiplist)
+   364	
+   365	    encoded: list[EncodedDoc] = []
+   366	    dropped: list[tuple[str, str]] = []
+   367	    dim = cfg["projection_out"]
+   368	
+   369	    for batch_start in range(0, len(docs), batch_size):
+   370	        batch = docs[batch_start : batch_start + batch_size]
+   371	        texts = [d["text"] for d in batch]
+   372	        try:
+   373	            features = pl.tokenize(texts, is_query=False)
+   374	            input_ids_pt = features["input_ids"]
+   375	            attn_pt = features["attention_mask"]
+   376	            type_ids_pt = features.get("token_type_ids")
+   377	            if type_ids_pt is None:
+   378	                # If absent (some tokenizers), default to zeros.
+   379	                import torch  # type: ignore
+   380	
+   381	                type_ids_pt = torch.zeros_like(input_ids_pt)
+   382	
+   383	            input_ids = mx.array(input_ids_pt.cpu().numpy().astype("int32"))
+   384	            attn = mx.array(attn_pt.cpu().numpy().astype("int32"))
+   385	            type_ids = mx.array(type_ids_pt.cpu().numpy().astype("int32"))
+   386	
+   387	            tok_emb = model(input_ids, attn, type_ids)  # [B, T, dim]
+   388	            # Force evaluation so we have concrete arrays for slicing.
+   389	            mx.eval(tok_emb)
+   390	        except Exception as e:  # noqa: BLE001
+   391	            for d in batch:
+   392	                dropped.append((str(d["doc_id"]), f"batch encode failed: {e!r}"))
+   393	            continue
+   394	
+   395	        # Apply keep mask (skiplist & attention_mask) per row.
+   396	        ids_np = input_ids_pt.cpu().numpy()
+   397	        attn_np = attn_pt.cpu().numpy()
+   398	        emb_np = tok_emb.astype(mx.float32)
+   399	        # mlx.array → host: prefer mx.eval + .tolist or numpy() if available
+   400	        if hasattr(emb_np, "__array__"):
+   401	            import numpy as np  # noqa: F401
+   402	
+   403	            emb_arr = mx.eval(emb_np)
+   404	            # mlx.core arrays support np.array(arr) conversion
+   405	            import numpy as np
+   406	
+   407	            emb_arr = np.array(emb_np, copy=False)
+   408	        else:
+   409	            import numpy as np
+   410	
+   411	            emb_arr = np.array(emb_np.tolist(), dtype=np.float32)
+   412	
+   413	        for b, d in enumerate(batch):
+   414	            try:
+   415	                row_ids = ids_np[b]
+   416	                row_attn = attn_np[b]
+   417	                kept_idx = [
+   418	                    i
+   419	                    for i in range(len(row_ids))
+   420	                    if row_attn[i] == 1 and int(row_ids[i]) not in skip_set
+   421	                ]
+   422	                if not kept_idx:
+   423	                    dropped.append((str(d["doc_id"]), "0-token output after masking"))
+   424	                    continue
+   425	                kept_ids = [int(row_ids[i]) for i in kept_idx]
+   426	                kept_emb = emb_arr[b, kept_idx, :]
+   427	                # Cast to float32 list-of-list for the shared writer.
+   428	                vectors = kept_emb.astype("float32").tolist()
+   429	                encoded.append(
+   430	                    EncodedDoc(
+   431	                        doc_id=str(d["doc_id"]),
+   432	                        token_ids=kept_ids,
+   433	                        vectors=vectors,
+   434	                    )
+   435	                )
+   436	            except Exception as e:  # noqa: BLE001
+   437	                dropped.append((str(d["doc_id"]), f"post-process failed: {e!r}"))
+   438	
+   439	    if not encoded:
+   440	        raise SystemExit("no docs encoded successfully — aborting before writing")
+   441	    return encoded, dropped, dim
+   442	
+   443	
+   444	def main() -> None:
+   445	    args = parse_args()
+   446	
+   447	    if args.weights is None:
+   448	        from export_colbert_to_mlx import _safe_name  # type: ignore
+   449	
+   450	        args.weights = (
+   451	            Path(__file__).resolve().parent / ".cache" / _safe_name(args.model) / "mlx_weights.safetensors"
+   452	        )
+   453	
+   454	    docs = read_docs_jsonl(args.docs, args.max_docs)
+   455	    if not docs:
+   456	        raise SystemExit(f"{args.docs}: no records found")
+   457	    print(f"loaded {len(docs)} docs from {args.docs}", file=sys.stderr)
+   458	
+   459	    encoded, dropped, dim = encode_docs_mlx(
+   460	        docs,
+   461	        model_name=args.model,
+   462	        weights_path=args.weights,
+   463	        dtype=args.dtype,
+   464	        batch_size=args.batch,
+   465	        trust_remote_code=args.trust_remote_code,
+   466	    )
+   467	    print(
+   468	        f"encoded {len(encoded)} docs (dim={dim}, dropped={len(dropped)})",
+   469	        file=sys.stderr,
+   470	    )
+   471	
+   472	    stats = write_tokens_bin(args.out, encoded, dim)
+   473	    print(
+   474	        f"wrote {args.out} "
+   475	        f"(n_docs={stats['n_docs']}, n_tokens={stats['n_tokens']}, dim={stats['dim']})",
+   476	        file=sys.stderr,
+   477	    )
+   478	
+   479	    meta_path = args.meta_out or args.out.with_suffix(args.out.suffix + ".meta.json")
+   480	    _write_metadata_shared(
+   481	        meta_path,
+   482	        mode="docs",
+   483	        model_name=args.model,
+   484	        dim=dim,
+   485	        n_docs=stats["n_docs"],
+   486	        n_tokens=stats["n_tokens"],
+   487	        doc_ids=[d.doc_id for d in encoded],
+   488	        dropped=dropped,
+   489	        docs_jsonl=args.docs,
+   490	        tool="tools/encode_mlx.py",
+   491	        tool_version="0.1",
+   492	    )
+   493	    print(f"wrote metadata {meta_path}", file=sys.stderr)
+   494	
+   495	
+   496	if __name__ == "__main__":
+   497	    main()
+
+exec
+/bin/zsh -lc "nl -ba tools/encode.py | sed -n '1,280p'" in /Users/satan/side/experiments/ir-multivector-retrieval
+ succeeded in 0ms:
+     1	#!/usr/bin/env python3
+     2	"""tools/encode.py — ColBERTv2 → token-dump binary (format v2, real vocab IDs).
+     3	
+     4	Owner: primitives-engineer.
+     5	See plan 01-primitives-and-io.plan.md and docs/token-dump-format.md.
+     6	
+     7	Reads docs.jsonl (one JSON object per line with at least "doc_id" and "text"
+     8	fields), encodes each document with a ColBERT-style model (default
+     9	`colbert-ir/colbertv2.0` via pylate), L2-normalises the per-token
+    10	embeddings, and writes the flat-binary format defined in
+    11	docs/token-dump-format.md plus a sidecar `tokens.meta.json`.
+    12	
+    13	Format v2 (this version) emits **real BERT vocabulary IDs** in
+    14	`token_ids[i]` so paper §3 TAC bucketing aggregates by surface vocabulary
+    15	("the" across docs lands in one cluster). v1 stored positional ids per
+    16	doc and degenerated TAC; the Zig parser rejects v1 files outright since
+    17	the constant flipped to 2.
+    18	
+    19	Usage:
+    20	    python tools/encode.py \\
+    21	        --docs   path/to/docs.jsonl \\
+    22	        --out    data/msmarco_v1/tokens.bin \\
+    23	        --model  colbert-ir/colbertv2.0 \\
+    24	        --device cpu \\
+    25	        --batch  16
+    26	
+    27	The model defaults to `colbert-ir/colbertv2.0` to match the paper. A
+    28	sibling project (ir-expo) found `jinaai/jina-colbert-v2-64` works
+    29	identically through the same pylate path; pass `--model` (with
+    30	`--trust-remote-code` for jina) to override.
+    31	
+    32	We bypass `pylate.models.ColBERT.encode` because that wrapper does not
+    33	return per-token vocab IDs in lockstep with the token embeddings.
+    34	Instead we drive `model.tokenize` → `model.forward` → `model.skiplist_mask`
+    35	ourselves and apply the exact same keep-mask to both the input_ids and
+    36	the token_embeddings. This mirrors the embedding-keep logic from
+    37	`pylate/models/colbert.py::encode` (lines ~688–720) one-for-one so the
+    38	emitted vectors are byte-identical to what `model.encode` would have
+    39	produced.
+    40	
+    41	Determinism: pylate/transformers pin model weights by revision; the
+    42	output bytes for a given (model, revision, doc list) are reproducible
+    43	modulo CPU/GPU non-determinism in the encoder. We do not introduce extra
+    44	randomness here.
+    45	
+    46	Best-effort robust to encoder failures: a doc that fails encoding is
+    47	skipped with a warning printed to stderr, and the metadata file records
+    48	both the surviving and dropped doc IDs.
+    49	"""
+    50	
+    51	from __future__ import annotations
+    52	
+    53	import argparse
+    54	import json
+    55	import sys
+    56	from pathlib import Path
+    57	
+    58	# torch / pylate are imported lazily inside encode_docs() so the CLI's
+    59	# --help and read_docs_jsonl path don't pay the multi-second import cost.
+    60	
+    61	# Shared writer + format constants — see tools/_tokens_bin.py. Re-exported
+    62	# here so external callers that imported them from this module (or the
+    63	# tests) keep working. Add the script's own directory to sys.path so the
+    64	# import works regardless of cwd (encode.py is typically run as
+    65	# `python tools/encode.py …` from the repo root).
+    66	sys.path.insert(0, str(Path(__file__).resolve().parent))
+    67	from _tokens_bin import (  # type: ignore  # noqa: E402
+    68	    DTYPE_F32,
+    69	    HEADER_SIZE,
+    70	    MAX_DIM,
+    71	    TOKEN_DUMP_MAGIC,
+    72	    TOKEN_DUMP_VERSION,
+    73	    EncodedDoc,
+    74	    write_metadata as _write_metadata_shared,
+    75	    write_qids_sidecar,
+    76	    write_tokens_bin,
+    77	)
+    78	
+    79	
+    80	def parse_args() -> argparse.Namespace:
+    81	    p = argparse.ArgumentParser(
+    82	        description="Encode docs.jsonl or queries.jsonl into tokens.bin (format v2)"
+    83	    )
+    84	    p.add_argument(
+    85	        "--mode",
+    86	        choices=("docs", "queries"),
+    87	        default="docs",
+    88	        help=(
+    89	            "encoding mode (default: docs). queries mode adds [Q] prefix via "
+    90	            "is_query=True and skips the skiplist drop so all query tokens "
+    91	            "are preserved per paper §5."
+    92	        ),
+    93	    )
+    94	    p.add_argument(
+    95	        "--docs",
+    96	        type=Path,
+    97	        required=True,
+    98	        help=(
+    99	            "path to input JSONL. In docs mode each line needs {doc_id, text}. "
+   100	            "In queries mode each line needs {qid, text}."
+   101	        ),
+   102	    )
+   103	    p.add_argument("--out", type=Path, required=True, help="output bin path")
+   104	    p.add_argument(
+   105	        "--model",
+   106	        type=str,
+   107	        default="colbert-ir/colbertv2.0",
+   108	        help="ColBERT model name (HuggingFace ID or local path)",
+   109	    )
+   110	    p.add_argument(
+   111	        "--device",
+   112	        type=str,
+   113	        default="cpu",
+   114	        help="torch device (cpu, cuda, cuda:0, mps)",
+   115	    )
+   116	    p.add_argument(
+   117	        "--batch",
+   118	        type=int,
+   119	        default=16,
+   120	        help=(
+   121	            "encoder batch size (legacy flag). New code should prefer "
+   122	            "--encoder-batch-size, which overrides this when set."
+   123	        ),
+   124	    )
+   125	    p.add_argument(
+   126	        "--dtype",
+   127	        choices=("fp32", "fp16", "auto"),
+   128	        default="auto",
+   129	        help=(
+   130	            "encoder weight dtype. fp32 keeps full precision; fp16 calls "
+   131	            "model.half() after load (4-6x faster on Apple Silicon MPS, "
+   132	            "~0.998 cosine parity vs fp32 in practice). 'auto' (default) "
+   133	            "picks fp16 on --device mps, fp32 on cpu/cuda — opt-out by "
+   134	            "passing fp32 explicitly. tokens.bin stays f32 regardless "
+   135	            "(cast happens before write). Mirrors sibling ir-expo's "
+   136	            "WARP_ENCODER_FP16=1 default on the same hardware."
+   137	        ),
+   138	    )
+   139	    p.add_argument(
+   140	        "--encoder-batch-size",
+   141	        type=int,
+   142	        default=None,
+   143	        help=(
+   144	            "encoder forward batch (overrides --batch when set). "
+   145	            "Default when unset: 32 on cpu/cuda, 256 on mps. Larger "
+   146	            "batches amortize pad cost and saturate the GPU; matches "
+   147	            "sibling ir-expo's WARP_ENCODER_BATCH_SIZE=256 default."
+   148	        ),
+   149	    )
+   150	    p.add_argument(
+   151	        "--max-docs",
+   152	        type=int,
+   153	        default=None,
+   154	        help="optional cap on docs (smoke testing)",
+   155	    )
+   156	    p.add_argument(
+   157	        "--trust-remote-code",
+   158	        action="store_true",
+   159	        help="pass through to pylate.models.ColBERT (needed for jina models)",
+   160	    )
+   161	    p.add_argument(
+   162	        "--meta-out",
+   163	        type=Path,
+   164	        default=None,
+   165	        help="sidecar metadata path; defaults to <out>.meta.json",
+   166	    )
+   167	    p.add_argument(
+   168	        "--sort-by-length",
+   169	        action="store_true",
+   170	        help=(
+   171	            "sort docs by tokenizer length before batching. Reduces padding "
+   172	            "waste 20-30%% on heterogeneous corpora at the cost of one extra "
+   173	            "tokenize pass. Encoded order is restored at write time so "
+   174	            "doc_id_map / qid_map remain in input order."
+   175	        ),
+   176	    )
+   177	    return p.parse_args()
+   178	
+   179	
+   180	def read_docs_jsonl(path: Path, max_docs: int | None, mode: str) -> list[dict]:
+   181	    """Load JSONL records. In `docs` mode each line is `{doc_id, text}`;
+   182	    in `queries` mode each line is `{qid, text}`. The id key is normalised to
+   183	    `doc_id` in the returned dicts so the rest of the pipeline (encode_docs,
+   184	    write_metadata) doesn't need to branch."""
+   185	    id_key = "doc_id" if mode == "docs" else "qid"
+   186	    out: list[dict] = []
+   187	    with path.open("r", encoding="utf-8") as f:
+   188	        for lineno, line in enumerate(f, start=1):
+   189	            line = line.strip()
+   190	            if not line:
+   191	                continue
+   192	            try:
+   193	                obj = json.loads(line)
+   194	            except json.JSONDecodeError as e:
+   195	                raise SystemExit(f"{path}:{lineno}: malformed JSON: {e}") from e
+   196	            if id_key not in obj or "text" not in obj:
+   197	                raise SystemExit(
+   198	                    f"{path}:{lineno}: each line needs '{id_key}' and 'text' fields"
+   199	                )
+   200	            # Normalise: downstream uses obj["doc_id"]; in queries mode that
+   201	            # holds the qid value.
+   202	            if mode == "queries":
+   203	                obj = {"doc_id": obj[id_key], "text": obj["text"]}
+   204	            out.append(obj)
+   205	            if max_docs is not None and len(out) >= max_docs:
+   206	                break
+   207	    return out
+   208	
+   209	
+   210	def encode_docs(
+   211	    docs: list[dict],
+   212	    *,
+   213	    mode: str,
+   214	    model_name: str,
+   215	    device: str,
+   216	    batch_size: int,
+   217	    trust_remote_code: bool,
+   218	    sort_by_length: bool = False,
+   219	    use_fp16: bool = False,
+   220	) -> tuple[list[EncodedDoc], list[tuple[str, str]], int]:
+   221	    """Returns (encoded, dropped, dim).
+   222	
+   223	    `dropped` is a list of (doc_id, reason) for docs that failed to encode.
+   224	
+   225	    Per-doc shape contract (mirrors `pylate.models.ColBERT.encode` for
+   226	    is_query=False, normalize=True):
+   227	        features = model.tokenize(texts, is_query=False)
+   228	            features["input_ids"]:      [B, T]   real BERT vocab IDs,
+   229	                                                  with [D] prefix inserted
+   230	            features["attention_mask"]: [B, T]
+   231	        out = model.forward(features)
+   232	            out["token_embeddings"]:    [B, T, dim]
+   233	            out["attention_mask"]:      [B, T]
+   234	        skip = model.skiplist_mask(features["input_ids"], model.skiplist)
+   235	        keep = (skip & out["attention_mask"]).bool()
+   236	        for b in range(B):
+   237	            kept_ids[b] = features["input_ids"][b, keep[b]]
+   238	            kept_emb[b] = out["token_embeddings"][b, keep[b], :]
+   239	            kept_emb[b] = F.normalize(kept_emb[b], p=2, dim=1)
+   240	
+   241	    The keep-mask is applied identically to both input_ids and embeddings,
+   242	    so token_ids[i] is the BERT vocab id of the same row as vectors[i].
+   243	    """
+   244	    import torch  # type: ignore
+   245	    from pylate import models  # type: ignore
+   246	
+   247	    model = models.ColBERT(
+   248	        model_name_or_path=model_name,
+   249	        trust_remote_code=trust_remote_code,
+   250	        device=device,
+   251	    )
+   252	    model.eval()
+   253	
+   254	    # FP16 weights for the M-series MPS speedup (4-6× on Apple Silicon).
+   255	    # Output tokens.bin is still f32: kept_emb is `.float()`-cast before
+   256	    # write in the per-doc loop, so the binary format is unaffected.
+   257	    # paper-gap: paper §4 doesn't mandate encoder weight dtype; ColBERT
+   258	    # vectors are L2-normalised so fp16 round-off stays >0.998 cosine vs
+   259	    # fp32 on real text.
+   260	    if use_fp16:
+   261	        model.half()
+   262	
+   263	    encoded: list[EncodedDoc] = []
+   264	    dropped: list[tuple[str, str]] = []
+   265	    dim: int | None = None
+   266	
+   267	    target_device = torch.device(device)
+   268	    is_query = mode == "queries"
+   269	
+   270	    # Metal compiles kernels on first use — without this 4-doc warmup the
+   271	    # first real batch eats 1-3 s of kernel compile and skews bench. Skip
+   272	    # on cpu where there are no kernels to compile.
+   273	    if target_device.type == "mps" and docs:
+   274	        warmup_texts = [d["text"] for d in docs[:4]] or ["warmup"]
+   275	        try:
+   276	            warm_features = model.tokenize(warmup_texts, is_query=is_query)
+   277	            warm_features = {
+   278	                k: (v.to(target_device) if hasattr(v, "to") else v)
+   279	                for k, v in warm_features.items()
+   280	            }
+
+codex
+The first pass shows a few concrete hot spots already: the MLX path still does manual attention, has no warmup/compiled function boundary, defaults to batch 32, and copies full padded embeddings back to CPU before masking. I’m checking the baseline and notes now so the payoff estimates match what’s already measured rather than generic advice.
+exec
+/bin/zsh -lc "nl -ba tests/live/mlx_parity.py | sed -n '1,340p'" in /Users/satan/side/experiments/ir-multivector-retrieval
+ succeeded in 0ms:
+     1	#!/usr/bin/env python3
+     2	"""tests/live/mlx_parity.py — 4-gate parity contract for tools/encode_mlx.py.
+     3	
+     4	Run:
+     5	    tools/.venv/bin/python tests/live/mlx_parity.py --mlx-parity
+     6	
+     7	Gates (each must pass; none skippable):
+     8	  1. Token-id byte equality between encode.py and encode_mlx.py.
+     9	  2. Per-token cosine ≥ 0.998 mean and ≥ 0.99 min on the live fixture.
+    10	  3. Two-run MLX determinism — byte-equal, or ≤ small ULP drift per float.
+    11	     (Note: the PyTorch encode.py baseline is itself non-deterministic
+    12	     across runs by ~1.5e-6 abs, owing to transformers 4.57's
+    13	     mean_resizing path firing during pylate's vocab expansion. This
+    14	     gate measures MLX's own self-consistency, not parity vs that drift.)
+    15	  4. Downstream TAC clustering: build a tac index from each token_dump
+    16	     with identical params/seed; assert headers (kappa_total, dim, n_*),
+    17	     and centroid arrays agree within 1e-3 cosine per centroid.
+    18	
+    19	The script does NOT auto-install MLX, the weight cache, or the venv —
+    20	it asserts they exist and gives a clean error if not.
+    21	
+    22	Args:
+    23	  --mlx-parity   required gate flag (mirrors -Dlive in zig)
+    24	  --max-docs     subset for fast smoke runs (default: all 100 fixture docs)
+    25	  --dtype        fp32 or fp16 (default fp16 — matches encode.py MPS default)
+    26	"""
+    27	from __future__ import annotations
+    28	
+    29	import argparse
+    30	import json
+    31	import math
+    32	import os
+    33	import struct
+    34	import subprocess
+    35	import sys
+    36	import time
+    37	from pathlib import Path
+    38	
+    39	REPO = Path(__file__).resolve().parents[2]
+    40	TOOLS = REPO / "tools"
+    41	VENV_PY = TOOLS / ".venv" / "bin" / "python"
+    42	FIXTURE = REPO / "tests" / "fixtures" / "live" / "docs.jsonl"
+    43	WEIGHTS_DIR = TOOLS / ".cache" / "colbert-ir__colbertv2.0"
+    44	MLX_WEIGHTS = WEIGHTS_DIR / "mlx_weights.safetensors"
+    45	
+    46	
+    47	# ---------------------------------------------------------------------------
+    48	# tokens.bin parser (mirrors src/io/token_dump.zig::parseBytes structurally;
+    49	# kept dependency-free so this script doesn't pull torch / mlx in itself).
+    50	# ---------------------------------------------------------------------------
+    51	
+    52	
+    53	def parse_tokens_bin(path: Path) -> dict:
+    54	    with path.open("rb") as f:
+    55	        data = f.read()
+    56	    if data[:8] != b"TAC_TKN1":
+    57	        raise SystemExit(f"{path}: bad magic {data[:8]!r}")
+    58	    version = struct.unpack("<I", data[8:12])[0]
+    59	    if version != 2:
+    60	        raise SystemExit(f"{path}: bad version {version}")
+    61	    dim = struct.unpack("<I", data[12:16])[0]
+    62	    n_docs = struct.unpack("<Q", data[16:24])[0]
+    63	    n_tok = struct.unpack("<Q", data[24:32])[0]
+    64	    if data[32] != 0:
+    65	        raise SystemExit(f"{path}: dtype != f32")
+    66	
+    67	    pos = 40
+    68	    offsets = list(struct.unpack(f"<{n_docs+1}Q", data[pos : pos + (n_docs + 1) * 8]))
+    69	    pos += (n_docs + 1) * 8
+    70	    ids = list(struct.unpack(f"<{n_tok}I", data[pos : pos + n_tok * 4]))
+    71	    pos += n_tok * 4
+    72	    vec_bytes = n_tok * dim * 4
+    73	    vecs = struct.unpack(f"<{n_tok*dim}f", data[pos : pos + vec_bytes])
+    74	    return {
+    75	        "dim": dim,
+    76	        "n_docs": n_docs,
+    77	        "n_tok": n_tok,
+    78	        "offsets": offsets,
+    79	        "ids": ids,
+    80	        "vecs": vecs,
+    81	    }
+    82	
+    83	
+    84	# ---------------------------------------------------------------------------
+    85	# tac index (.tac) header + centroids parser.
+    86	#
+    87	# Layout (src/index/storage.zig):
+    88	#   header (112 bytes inside a 128-byte region)
+    89	#     [8] magic "TAC_IDX1"
+    90	#     u32 version
+    91	#     u32 dim
+    92	#     u32 kappa
+    93	#     u32 pq_M
+    94	#     u8  pq_bits
+    95	#     u8[3] _pad
+    96	#     u32 sub_dim
+    97	#     u64 n_docs
+    98	#     u64 n_tokens
+    99	#     u64 centroids_off
+   100	#     u64 hnsw_off, pq_off, ilist_off, doc_off, doc_tok_off, norms_off, footer_off
+   101	#   <padding to 128>
+   102	#   centroids: kappa * dim f32 row-major
+   103	#   ...
+   104	# ---------------------------------------------------------------------------
+   105	
+   106	
+   107	def parse_tac_header_centroids(path: Path) -> dict:
+   108	    with path.open("rb") as f:
+   109	        data = f.read()
+   110	    if data[:8] != b"TAC_IDX1":
+   111	        raise SystemExit(f"{path}: bad TAC index magic {data[:8]!r}")
+   112	    pos = 8
+   113	    version = struct.unpack("<I", data[pos : pos + 4])[0]; pos += 4
+   114	    dim = struct.unpack("<I", data[pos : pos + 4])[0]; pos += 4
+   115	    kappa = struct.unpack("<I", data[pos : pos + 4])[0]; pos += 4
+   116	    pq_M = struct.unpack("<I", data[pos : pos + 4])[0]; pos += 4
+   117	    pq_bits = data[pos]; pos += 1
+   118	    pos += 3  # _pad
+   119	    sub_dim = struct.unpack("<I", data[pos : pos + 4])[0]; pos += 4
+   120	    n_docs = struct.unpack("<Q", data[pos : pos + 8])[0]; pos += 8
+   121	    n_tokens = struct.unpack("<Q", data[pos : pos + 8])[0]; pos += 8
+   122	    centroids_off = struct.unpack("<Q", data[pos : pos + 8])[0]; pos += 8
+   123	
+   124	    cent_bytes = kappa * dim * 4
+   125	    centroids = struct.unpack(
+   126	        f"<{kappa*dim}f", data[centroids_off : centroids_off + cent_bytes]
+   127	    )
+   128	    return {
+   129	        "version": version,
+   130	        "dim": dim,
+   131	        "kappa": kappa,
+   132	        "pq_M": pq_M,
+   133	        "pq_bits": pq_bits,
+   134	        "sub_dim": sub_dim,
+   135	        "n_docs": n_docs,
+   136	        "n_tokens": n_tokens,
+   137	        "centroids": centroids,
+   138	    }
+   139	
+   140	
+   141	# ---------------------------------------------------------------------------
+   142	# Math helpers
+   143	# ---------------------------------------------------------------------------
+   144	
+   145	
+   146	def cosine(a: tuple[float, ...], b: tuple[float, ...]) -> float:
+   147	    if len(a) != len(b):
+   148	        raise SystemExit(f"length mismatch {len(a)} vs {len(b)}")
+   149	    na = math.sqrt(sum(x * x for x in a))
+   150	    nb = math.sqrt(sum(x * x for x in b))
+   151	    if na == 0.0 or nb == 0.0:
+   152	        return 0.0
+   153	    return sum(x * y for x, y in zip(a, b)) / (na * nb)
+   154	
+   155	
+   156	def cosines_per_token(pt: dict, mlx: dict) -> list[float]:
+   157	    if pt["n_tok"] != mlx["n_tok"] or pt["dim"] != mlx["dim"]:
+   158	        raise SystemExit(
+   159	            f"shape mismatch: pt n_tok={pt['n_tok']} dim={pt['dim']} vs "
+   160	            f"mlx n_tok={mlx['n_tok']} dim={mlx['dim']}"
+   161	        )
+   162	    dim = pt["dim"]
+   163	    out = []
+   164	    for i in range(pt["n_tok"]):
+   165	        a = pt["vecs"][i * dim : (i + 1) * dim]
+   166	        b = mlx["vecs"][i * dim : (i + 1) * dim]
+   167	        out.append(cosine(a, b))
+   168	    return out
+   169	
+   170	
+   171	# ---------------------------------------------------------------------------
+   172	# Subprocess helpers (encoders + tac index build)
+   173	# ---------------------------------------------------------------------------
+   174	
+   175	
+   176	def run(cmd: list[str], *, cwd: Path | None = None) -> tuple[float, str]:
+   177	    t0 = time.perf_counter()
+   178	    res = subprocess.run(
+   179	        cmd, cwd=str(cwd) if cwd else None, capture_output=True, text=True
+   180	    )
+   181	    elapsed = time.perf_counter() - t0
+   182	    if res.returncode != 0:
+   183	        raise SystemExit(
+   184	            f"command failed (exit {res.returncode}):\n  {' '.join(cmd)}\n"
+   185	            f"stderr:\n{res.stderr}\nstdout:\n{res.stdout}"
+   186	        )
+   187	    return elapsed, res.stderr
+   188	
+   189	
+   190	def encode_pt(out: Path, max_docs: int | None, dtype: str) -> float:
+   191	    args = [
+   192	        str(VENV_PY),
+   193	        str(TOOLS / "encode.py"),
+   194	        "--docs", str(FIXTURE),
+   195	        "--out", str(out),
+   196	        "--device", "cpu",
+   197	        "--dtype", dtype,
+   198	        "--batch", "16",
+   199	    ]
+   200	    if max_docs is not None:
+   201	        args += ["--max-docs", str(max_docs)]
+   202	    elapsed, _ = run(args, cwd=REPO)
+   203	    return elapsed
+   204	
+   205	
+   206	def encode_mlx(out: Path, max_docs: int | None, dtype: str) -> float:
+   207	    args = [
+   208	        str(VENV_PY),
+   209	        str(TOOLS / "encode_mlx.py"),
+   210	        "--docs", str(FIXTURE),
+   211	        "--out", str(out),
+   212	        "--dtype", dtype,
+   213	        "--batch", "32",
+   214	        "--weights", str(MLX_WEIGHTS),
+   215	    ]
+   216	    if max_docs is not None:
+   217	        args += ["--max-docs", str(max_docs)]
+   218	    elapsed, _ = run(args, cwd=REPO)
+   219	    return elapsed
+   220	
+   221	
+   222	def tac_index(tokens_bin: Path, out_tac: Path, kappa: int, seed: int) -> None:
+   223	    tac_bin = REPO / "zig-out" / "bin" / "tac"
+   224	    if not tac_bin.exists():
+   225	        # Build it once.
+   226	        run(["zig", "build", "-Doptimize=ReleaseFast"], cwd=REPO)
+   227	    if not tac_bin.exists():
+   228	        raise SystemExit(f"tac binary not found at {tac_bin} after zig build")
+   229	    run([
+   230	        str(tac_bin), "index",
+   231	        str(tokens_bin), str(out_tac),
+   232	        "--kappa", str(kappa), "--seed", str(seed),
+   233	    ], cwd=REPO)
+   234	
+   235	
+   236	# ---------------------------------------------------------------------------
+   237	# Gates
+   238	# ---------------------------------------------------------------------------
+   239	
+   240	
+   241	def gate1_token_ids(pt: dict, mlx: dict) -> tuple[bool, str]:
+   242	    if pt["ids"] != mlx["ids"]:
+   243	        diffs = sum(1 for a, b in zip(pt["ids"], mlx["ids"]) if a != b)
+   244	        return False, f"token_ids differ: {diffs}/{len(pt['ids'])} positions"
+   245	    if pt["offsets"] != mlx["offsets"]:
+   246	        return False, "doc_offsets (CSR) differ"
+   247	    return True, f"token_ids byte-equal ({len(pt['ids'])} ids; offsets equal)"
+   248	
+   249	
+   250	def gate2_cosine(pt: dict, mlx: dict, mean_floor: float, min_floor: float) -> tuple[bool, str]:
+   251	    cos = cosines_per_token(pt, mlx)
+   252	    cos_sorted = sorted(cos)
+   253	    n = len(cos)
+   254	    mean = sum(cos) / n
+   255	    cmin = cos_sorted[0]
+   256	    p1 = cos_sorted[max(0, n // 100)]
+   257	    msg = (
+   258	        f"cosine mean={mean:.6f} min={cmin:.6f} p1={p1:.6f} "
+   259	        f"max={cos_sorted[-1]:.6f} (n={n})"
+   260	    )
+   261	    if mean < mean_floor:
+   262	        return False, msg + f" — mean below floor {mean_floor}"
+   263	    if cmin < min_floor:
+   264	        return False, msg + f" — min below floor {min_floor}"
+   265	    return True, msg
+   266	
+   267	
+   268	def gate3_determinism(out_a: Path, out_b: Path, max_docs: int | None, dtype: str) -> tuple[bool, str]:
+   269	    encode_mlx(out_a, max_docs, dtype)
+   270	    encode_mlx(out_b, max_docs, dtype)
+   271	    a = parse_tokens_bin(out_a)
+   272	    b = parse_tokens_bin(out_b)
+   273	    if a["ids"] != b["ids"] or a["offsets"] != b["offsets"]:
+   274	        return False, "two-run determinism: token_ids/offsets differ"
+   275	
+   276	    # Compare floats with strict byte-equality first; if that fails, fall
+   277	    # back to ULP-class threshold (≤ 4 ULPs ≈ ~5e-7 abs for fp32 values
+   278	    # near 0.1, OK for L2-normalised ColBERT vectors).
+   279	    diffs = 0
+   280	    max_abs = 0.0
+   281	    for x, y in zip(a["vecs"], b["vecs"]):
+   282	        if x != y:
+   283	            diffs += 1
+   284	            d = abs(x - y)
+   285	            if d > max_abs:
+   286	                max_abs = d
+   287	    n = len(a["vecs"])
+   288	    if diffs == 0:
+   289	        return True, f"two-run byte-identical ({n} floats)"
+   290	    # ULP-class threshold for fp32 vectors with |x| ≤ 1 (L2-normalised, dim=128):
+   291	    # 1 ULP ≈ 2**-23 ≈ 1.19e-7. Allow ≤ 4 ULPs.
+   292	    threshold = 5e-7
+   293	    if max_abs <= threshold:
+   294	        return True, (
+   295	            f"two-run within ULP-class threshold "
+   296	            f"({diffs}/{n} floats differ; max abs {max_abs:.2e} ≤ {threshold:.2e})"
+   297	        )
+   298	    return False, (
+   299	        f"two-run determinism failed: {diffs}/{n} floats differ; "
+   300	        f"max abs {max_abs:.2e} > {threshold:.2e}"
+   301	    )
+   302	
+   303	
+   304	def gate4_clustering(pt_bin: Path, mlx_bin: Path, kappa: int, seed: int) -> tuple[bool, str]:
+   305	    pt_tac = pt_bin.with_suffix(".pt.tac")
+   306	    mlx_tac = mlx_bin.with_suffix(".mlx.tac")
+   307	    tac_index(pt_bin, pt_tac, kappa=kappa, seed=seed)
+   308	    tac_index(mlx_bin, mlx_tac, kappa=kappa, seed=seed)
+   309	
+   310	    pt_idx = parse_tac_header_centroids(pt_tac)
+   311	    mlx_idx = parse_tac_header_centroids(mlx_tac)
+   312	
+   313	    # Header agreement on kappa/dim/n_*.
+   314	    for key in ("dim", "kappa", "n_docs", "n_tokens"):
+   315	        if pt_idx[key] != mlx_idx[key]:
+   316	            return False, f"tac header field {key!r} differs: pt={pt_idx[key]} mlx={mlx_idx[key]}"
+   317	
+   318	    # Per-centroid cosine similarity. Centroid c maps the same vocab id
+   319	    # cluster on both sides (kappa_per_token is determined by token_id
+   320	    # frequencies, which gate 1 already proved equal), so centroid i on
+   321	    # both sides clusters the same token-id subset.
+   322	    dim = pt_idx["dim"]
+   323	    kappa_v = pt_idx["kappa"]
+   324	    pt_c = pt_idx["centroids"]
+   325	    mlx_c = mlx_idx["centroids"]
+   326	    cos_per_centroid = []
+   327	    for i in range(kappa_v):
+   328	        a = pt_c[i * dim : (i + 1) * dim]
+   329	        b = mlx_c[i * dim : (i + 1) * dim]
+   330	        cos_per_centroid.append(cosine(a, b))
+   331	
+   332	    cmin = min(cos_per_centroid)
+   333	    cmean = sum(cos_per_centroid) / len(cos_per_centroid)
+   334	    msg = (
+   335	        f"tac kappa={kappa_v} dim={dim} centroid cosine mean={cmean:.6f} min={cmin:.6f}"
+   336	    )
+   337	    # Plan threshold: centroid means agree within 1e-3 cosine (so ≥ 1 - 1e-3 = 0.999).
+   338	    if cmin < 0.999:
+   339	        return False, msg + f" — min < 0.999"
+   340	    return True, msg
+
+exec
+/bin/zsh -lc "nl -ba tools/encode.py | sed -n '280,620p'" in /Users/satan/side/experiments/ir-multivector-retrieval
+ succeeded in 0ms:
+   280	            }
+   281	            with torch.no_grad():
+   282	                model.forward(input=warm_features)
+   283	            torch.mps.synchronize()
+   284	        except Exception as e:  # noqa: BLE001
+   285	            print(f"warmup pass failed (continuing): {e!r}", file=sys.stderr)
+   286	
+   287	    # Optional length-sort: encode docs in tokenizer-length order so each
+   288	    # batch pads to its own longest member rather than the global longest.
+   289	    # Output is restored to input order at the end so the caller's
+   290	    # doc_id_map / qid_map stays meaningful.
+   291	    encode_order: list[int]
+   292	    if sort_by_length:
+   293	        # Use a cheap proxy: character length. The model.tokenize call would
+   294	        # be more accurate but doubles the tokenize cost; char length
+   295	        # correlates well enough on natural text for batch packing.
+   296	        encode_order = sorted(range(len(docs)), key=lambda i: len(docs[i]["text"]))
+   297	        docs = [docs[i] for i in encode_order]
+   298	        print(f"sorted {len(docs)} docs by char length for tighter batches", file=sys.stderr)
+   299	    else:
+   300	        encode_order = list(range(len(docs)))
+   301	
+   302	    # Track the encoded item's input position; we restore order at the end.
+   303	    sorted_to_input: list[int] = encode_order
+   304	
+   305	    for batch_start in range(0, len(docs), batch_size):
+   306	        batch = docs[batch_start : batch_start + batch_size]
+   307	        texts = [d["text"] for d in batch]
+   308	        try:
+   309	            features = model.tokenize(texts, is_query=is_query)
+   310	            features = {
+   311	                k: (v.to(target_device) if hasattr(v, "to") else v)
+   312	                for k, v in features.items()
+   313	            }
+   314	            with torch.no_grad():
+   315	                out = model.forward(input=features)
+   316	            input_ids = features["input_ids"]  # [B, T]
+   317	            tok_emb = out["token_embeddings"]  # [B, T, dim]
+   318	            attn = out["attention_mask"].bool()
+   319	            if is_query:
+   320	                # paper §5: queries keep all attended tokens (no skiplist drop)
+   321	                # so n_q includes the [Q] prefix and any punctuation. ColBERT/
+   322	                # pylate also pads queries to a fixed max_query_length; the
+   323	                # attention mask handles the padding bits.
+   324	                keep = attn
+   325	            else:
+   326	                skip = model.skiplist_mask(
+   327	                    input_ids=input_ids, skiplist=model.skiplist
+   328	                ).bool()
+   329	                keep = skip & attn
+   330	        except Exception as e:  # noqa: BLE001
+   331	            for d in batch:
+   332	                dropped.append((str(d["doc_id"]), f"batch encode failed: {e!r}"))
+   333	            continue
+   334	
+   335	        for b, d in enumerate(batch):
+   336	            try:
+   337	                kept_mask = keep[b]
+   338	                kept_ids = input_ids[b][kept_mask].detach().cpu().tolist()
+   339	                kept_emb = tok_emb[b][kept_mask].detach().cpu().float()
+   340	                # Defensive renormalize — matches the encode() path
+   341	                # (normalize_embeddings=True is the pylate default).
+   342	                kept_emb = torch.nn.functional.normalize(kept_emb, p=2, dim=1)
+   343	
+   344	                if kept_emb.dim() != 2:
+   345	                    dropped.append(
+   346	                        (str(d["doc_id"]), f"unexpected encoder shape {tuple(kept_emb.shape)}")
+   347	                    )
+   348	                    continue
+   349	                n_tok, d_dim = int(kept_emb.shape[0]), int(kept_emb.shape[1])
+   350	                if d_dim == 0 or d_dim > MAX_DIM:
+   351	                    dropped.append(
+   352	                        (str(d["doc_id"]), f"dim {d_dim} outside [1, {MAX_DIM}]")
+   353	                    )
+   354	                    continue
+   355	                if n_tok == 0:
+   356	                    dropped.append((str(d["doc_id"]), "0-token output after masking"))
+   357	                    continue
+   358	                if len(kept_ids) != n_tok:
+   359	                    dropped.append(
+   360	                        (
+   361	                            str(d["doc_id"]),
+   362	                            f"id/embedding length mismatch: {len(kept_ids)} != {n_tok}",
+   363	                        )
+   364	                    )
+   365	                    continue
+   366	                if dim is None:
+   367	                    dim = d_dim
+   368	                elif dim != d_dim:
+   369	                    dropped.append(
+   370	                        (
+   371	                            str(d["doc_id"]),
+   372	                            f"dim drift: expected {dim}, got {d_dim}",
+   373	                        )
+   374	                    )
+   375	                    continue
+   376	                encoded.append(
+   377	                    EncodedDoc(
+   378	                        doc_id=str(d["doc_id"]),
+   379	                        token_ids=[int(x) for x in kept_ids],
+   380	                        vectors=kept_emb.tolist(),
+   381	                    )
+   382	                )
+   383	            except Exception as e:  # noqa: BLE001
+   384	                dropped.append((str(d["doc_id"]), f"post-process failed: {e!r}"))
+   385	
+   386	    if dim is None:
+   387	        raise SystemExit("no docs encoded successfully — aborting before writing")
+   388	
+   389	    # Restore input-order if we sorted. Build a doc_id → encoded slot map
+   390	    # then walk encode_order to materialise the original sequence.
+   391	    if sort_by_length:
+   392	        by_id = {e.doc_id: e for e in encoded}
+   393	        # `sorted_to_input` holds input-side indices in tokenize-batch order;
+   394	        # we want to emit in the original input order. So iterate input
+   395	        # indices 0..N-1, find the doc_id at that input position via the
+   396	        # original `docs` list captured pre-sort isn't visible here — instead
+   397	        # we sort `encoded` by the dict insertion of doc_ids by input index.
+   398	        # Simpler: sort `encoded` by the position of its doc_id in the
+   399	        # *post-sort* order, then invert that permutation.
+   400	        # In practice the cleanest path is: sort `encoded` by an input-order
+   401	        # key. The caller passes input doc IDs separately, so let the caller
+   402	        # restore order if it cares. For now, leave `encoded` in encode order
+   403	        # — the sidecar JSON's doc_id_map then reflects encode order, which
+   404	        # downstream consumers should handle.
+   405	        _ = by_id  # silence unused
+   406	        _ = sorted_to_input
+   407	    return encoded, dropped, dim
+   408	
+   409	
+   410	def write_metadata(
+   411	    meta_path: Path,
+   412	    *,
+   413	    mode: str,
+   414	    model_name: str,
+   415	    dim: int,
+   416	    n_docs: int,
+   417	    n_tokens: int,
+   418	    doc_ids: list[str],
+   419	    dropped: list[tuple[str, str]],
+   420	    docs_jsonl: Path,
+   421	) -> None:
+   422	    """Thin wrapper that pins the `tool`/`tool_version` strings for this
+   423	    encoder; everything else delegates to _tokens_bin.write_metadata."""
+   424	    _write_metadata_shared(
+   425	        meta_path,
+   426	        mode=mode,
+   427	        model_name=model_name,
+   428	        dim=dim,
+   429	        n_docs=n_docs,
+   430	        n_tokens=n_tokens,
+   431	        doc_ids=doc_ids,
+   432	        dropped=dropped,
+   433	        docs_jsonl=docs_jsonl,
+   434	        tool="tools/encode.py",
+   435	        tool_version="0.3",
+   436	    )
+   437	
+   438	
+   439	def main() -> None:
+   440	    args = parse_args()
+   441	
+   442	    docs = read_docs_jsonl(args.docs, args.max_docs, args.mode)
+   443	    if not docs:
+   444	        raise SystemExit(f"{args.docs}: no records found")
+   445	    noun = "queries" if args.mode == "queries" else "docs"
+   446	    print(f"loaded {len(docs)} {noun} from {args.docs}", file=sys.stderr)
+   447	
+   448	    # Resolve auto-defaults for dtype + encoder batch size based on device.
+   449	    # 'auto' picks fp16/256 on mps, fp32/32 elsewhere — matches sibling
+   450	    # ir-expo's proven WARP defaults on the same Apple Silicon hardware.
+   451	    # --encoder-batch-size overrides --batch when set; otherwise on cpu/cuda
+   452	    # we fall back to --batch (preserving today's behavior with --batch 16).
+   453	    is_mps = args.device.startswith("mps")
+   454	    if args.dtype == "auto":
+   455	        use_fp16 = is_mps
+   456	    else:
+   457	        use_fp16 = args.dtype == "fp16"
+   458	    if args.encoder_batch_size is not None:
+   459	        encoder_batch = args.encoder_batch_size
+   460	    elif is_mps:
+   461	        encoder_batch = 256
+   462	    else:
+   463	        encoder_batch = args.batch
+   464	
+   465	    encoded, dropped, dim = encode_docs(
+   466	        docs,
+   467	        mode=args.mode,
+   468	        model_name=args.model,
+   469	        device=args.device,
+   470	        batch_size=encoder_batch,
+   471	        trust_remote_code=args.trust_remote_code,
+   472	        sort_by_length=args.sort_by_length,
+   473	        use_fp16=use_fp16,
+   474	    )
+   475	    print(
+   476	        f"encoded {len(encoded)} {noun} (dim={dim}, dropped={len(dropped)})",
+   477	        file=sys.stderr,
+   478	    )
+   479	
+   480	    stats = write_tokens_bin(args.out, encoded, dim)
+   481	    print(
+   482	        f"wrote {args.out} "
+   483	        f"(n_docs={stats['n_docs']}, n_tokens={stats['n_tokens']}, dim={stats['dim']})",
+   484	        file=sys.stderr,
+   485	    )
+   486	
+   487	    meta_path = args.meta_out or args.out.with_suffix(args.out.suffix + ".meta.json")
+   488	    write_metadata(
+   489	        meta_path,
+   490	        mode=args.mode,
+   491	        model_name=args.model,
+   492	        dim=dim,
+   493	        n_docs=stats["n_docs"],
+   494	        n_tokens=stats["n_tokens"],
+   495	        doc_ids=[d.doc_id for d in encoded],
+   496	        dropped=dropped,
+   497	        docs_jsonl=args.docs,
+   498	    )
+   499	    print(f"wrote metadata {meta_path}", file=sys.stderr)
+   500	
+   501	    if args.mode == "queries":
+   502	        qids_path = args.out.with_suffix(args.out.suffix + ".qids")
+   503	        write_qids_sidecar(qids_path, [d.doc_id for d in encoded])
+   504	        print(
+   505	            f"wrote qids sidecar {qids_path} "
+   506	            f"(n_queries={len(encoded)}, u32 LE)",
+   507	            file=sys.stderr,
+   508	        )
+   509	
+   510	
+   511	if __name__ == "__main__":
+   512	    main()
+
+exec
+/bin/zsh -lc "nl -ba tools/LIVE_ENCODER_NOTES.md | sed -n '1,260p'" in /Users/satan/side/experiments/ir-multivector-retrieval
+ succeeded in 0ms:
+     1	# Live encoder notes
+     2	
+     3	Captured from a real `tools/encode.py` run on `tests/fixtures/live/docs.jsonl`
+     4	(100 synthetic English docs, deliberately overlapping vocabulary across
+     5	three thematic clusters: cooking, weather, software releases).
+     6	
+     7	This file is the contract retriever's task #20 benchmark harness consumes
+     8	when it picks shape parameters for MS MARCO / LoTTE. Update on every
+     9	encoder version bump.
+    10	
+    11	## Source
+    12	
+    13	- Fixture: `tests/fixtures/live/docs.jsonl`, generated by
+    14	  `tests/fixtures/live/build_docs.py` (seed 2026, 100 docs).
+    15	- Encoder: `colbert-ir/colbertv2.0` via pylate 1.4.0, torch 2.9.0,
+    16	  transformers 4.56.2 (pin set copied from sibling
+    17	  `services/warp-service/requirements.txt`).
+    18	- Reproduce:
+    19	  ```bash
+    20	  python tests/fixtures/live/build_docs.py
+    21	  python tools/encode.py --docs tests/fixtures/live/docs.jsonl \
+    22	      --out tests/fixtures/live/tokens.bin --device cpu --batch 16
+    23	  ```
+    24	
+    25	## Encoder dtype + batch size (post-hackathon plan 08)
+    26	
+    27	`tools/encode.py` exposes two flags whose auto-defaults follow `--device`:
+    28	
+    29	| flag | cpu / cuda | mps |
+    30	|---|---|---|
+    31	| `--dtype` | fp32 | fp16 (`model.half()` after load) |
+    32	| `--encoder-batch-size` | 32 | 256 |
+    33	
+    34	`--dtype auto` (default) picks fp16 only on `--device mps`; cpu/cuda stay
+    35	fp32. Pass `--dtype fp32` explicitly to opt out on MPS. tokens.bin is f32
+    36	regardless — the per-doc loop already does `.cpu().float()` before
+    37	normalisation, so the on-disk format is unchanged. We also run a 4-doc
+    38	warmup pass on MPS so the first real batch isn't measuring Metal kernel
+    39	compilation.
+    40	
+    41	Pattern mirrors sibling `services/warp-service/server.py` lines 187–231,
+    42	which already runs `WARP_ENCODER_FP16=1` + `WARP_ENCODER_BATCH_SIZE=256`
+    43	on the same Apple Silicon hardware.
+    44	
+    45	### Measured speedup (Apple Silicon, jina-colbert-v2-64)
+    46	
+    47	End-to-end CLI wall-clock on `tests/fixtures/live/docs.jsonl` (100 docs,
+    48	1697 kept tokens), back-to-back so HF cache is warm:
+    49	
+    50	| invocation                                 | wall   | speedup |
+    51	|--------------------------------------------|--------|---------|
+    52	| fp32, encoder-batch-size 32                | 12.4 s | 1.00×   |
+    53	| fp16, encoder-batch-size 256               |  9.6 s | 1.29×   |
+    54	
+    55	Encode-loop only (model already loaded, includes warmup, excludes load):
+    56	
+    57	| corpus                          | fp32 bs=32 | fp16 bs=256 | speedup |
+    58	|---------------------------------|-----------:|------------:|--------:|
+    59	| 100 short synthetic docs        |    1.42 s  |     0.65 s  |  2.17×  |
+    60	| 1000 real Jira docs (avg 2.7 kB)|  128.79 s  |    90.18 s  |  1.43×  |
+    61	
+    62	The advertised 4-6× lever from plan 08's overview did not materialise on
+    63	this hardware / model: the live fixture is too small to saturate the GPU
+    64	(model load dominates wall-clock), and on the longer Jira docs the
+    65	encoder is bandwidth-bound rather than compute-bound. The speedup is
+    66	real but in the 1.3-2× band, not 4-6×. Worth re-measuring on the full
+    67	corpus + a larger ColBERT model where the matmuls dominate.
+    68	
+    69	### FP32 vs FP16 numerical parity
+    70	
+    71	10 docs encoded twice through the same path, cosine similarity computed
+    72	between corresponding L2-normalised token vectors:
+    73	
+    74	| metric              | value    |
+    75	|---------------------|----------|
+    76	| n token pairs       | 173      |
+    77	| mean cosine         | 0.999998 |
+    78	| min cosine          | 0.999783 |
+    79	| worst per-doc min   | 0.999783 |
+    80	
+    81	Well above the 0.998 floor — FP16 is safe to default-on for MPS.
+    82	
+    83	## Output shape
+    84	
+    85	| field            | value                                      |
+    86	|------------------|--------------------------------------------|
+    87	| format version   | 2                                          |
+    88	| dim              | 128                                        |
+    89	| n_docs           | 100                                        |
+    90	| n_tokens         | 1592                                       |
+    91	| avg tokens/doc   | 15.92                                      |
+    92	| file size        | 822 320 bytes (~803 KB)                    |
+    93	| dropped          | 0                                          |
+    94	| dtype            | f32                                        |
+    95	| encode wall-clock| ~20 s on Apple Silicon CPU (single batch)  |
+    96	
+    97	## Vocabulary distribution
+    98	
+    99	After applying ColBERT's keep-mask (skiplist drops punctuation; CLS, [D]
+   100	prefix, and SEP are kept) the corpus reduces to **91 distinct vocab IDs**
+   101	across 1592 token rows.
+   102	
+   103	| n_j threshold | % of distinct vocab IDs |
+   104	|---------------|------------------------:|
+   105	| n_j ≥ 2       | 100.0 %                 |
+   106	| n_j ≥ 5       | 86.8 %                  |
+   107	| n_j ≥ 10      | 45.1 %                  |
+   108	
+   109	Top 10 token IDs by frequency:
+   110	
+   111	| token_id | n_j | surface form (BERT WordPiece) |
+   112	|---------:|----:|-------------------------------|
+   113	|     1996 | 166 | the                            |
+   114	|      101 | 100 | [CLS] (one per doc)            |
+   115	|    30523 | 100 | [D] (pylate doc-prefix)        |
+   116	|      102 | 100 | [SEP]                          |
+   117	|     1997 |  69 | of                             |
+   118	|     2003 |  69 | is                             |
+   119	|     1998 |  51 | and                            |
+   120	|     2007 |  51 | with                           |
+   121	|     2544 |  48 | morning                        |
+   122	|    17974 |  40 | recipe                         |
+   123	
+   124	Implications retriever should know about for #20:
+   125	
+   126	1. **CLS/[D]/SEP form a 3-way tie at n_j = n_docs.** TAC will allocate κ_j
+   127	   to these as if they were genuine "high-information" tokens. They are
+   128	   fine for the gather-phase ⟨q, c⟩ accumulator (paper §5.1) because every
+   129	   query also produces them, but be aware that their centroids will sit
+   130	   on the per-token cluster mean of an essentially uniform direction.
+   131	2. **No singletons in this fixture.** That's deliberate — it stresses the
+   132	   `n_j ≥ 2` aliasing path. On a real MS MARCO sample expect a long-tail
+   133	   of singletons that fall into TAC's micro tier (n_j < μ=128 → κ_j=1).
+   134	3. **Embedding dim is 128.** PQ M=32 subspaces gives 4 dims/subspace
+   135	   (paper §4 default) — confirmed compatible with the indexer's PQ trainer.
+   136	4. **ColBERTv2 is downloaded on first use.** First encode pays a
+   137	   ~one-time HuggingFace fetch into `~/.cache/huggingface`. Subsequent
+   138	   runs are warm.
+   139	
+   140	## Provisioning a venv
+   141	
+   142	The pinned set lives in `services/warp-service/requirements.txt` (sibling
+   143	project, already proven). For this repo the simplest path is to reuse
+   144	that venv — copying the requirements file to `tools/.venv` works too:
+   145	
+   146	```bash
+   147	# Reuse:
+   148	ln -s ../../ir-expo/services/warp-service/.venv tools/.venv
+   149	
+   150	# Or create fresh from the same pins:
+   151	uv venv --python 3.13 tools/.venv
+   152	uv pip install --python tools/.venv/bin/python \
+   153	    -r ../ir-expo/services/warp-service/requirements.txt
+   154	```
+   155	
+   156	Either way, run encode through `tools/.venv/bin/python tools/encode.py …`.
+   157	The harness gate `-Dlive=true` reads `tests/fixtures/live/tokens.bin`
+   158	directly — it doesn't depend on the venv at Zig-build time.
+   159	
+   160	## Live harness (Zig side)
+   161	
+   162	- File: `tests/live/vocab_aliasing.zig`
+   163	- Build flag: `-Dlive=true` (wired in `build.zig`)
+   164	- Tests:
+   165	  1. `live: token dump parses with v2 magic + version` — sanity check.
+   166	  2. `live: ≥50% of distinct token_ids show n_j ≥ 2 (paper §3 vocab
+   167	     aliasing)` — observed **100.0%** (91/91) on this fixture.
+   168	  3. `live: tac.cluster runs end-to-end on the real corpus` — runs
+   169	     `tac.tac.cluster` with κ_total=92 (calibrated for the all-tail
+   170	     tier distribution of this small fixture, see budget calibration
+   171	     comment in the test). Observed WCSS_total ≈ 502.272.
+   172	
+   173	Default `zig build test` (without `-Dlive`) stays Python-free and the
+   174	fixture binary is gitignored — contributors without torch/pylate
+   175	provisioned see no impact.
+   176	
+   177	### Why κ_total=92 specifically
+   178	
+   179	With n_distinct=91 vocab IDs and *all* of them in the µ=128 / τ=256
+   180	tail tier (90 micro at κ_j=1, 1 small at κ_j=2, 0 active), Phase 1's
+   181	tail-only κ-sum is 92. There is no active-tier slack to absorb extra
+   182	budget, so any κ_total > 92 hits `error.BudgetTooLarge` from Phase 4
+   183	(the cap n_j/κ_j ≥ θ=39 has no slack to grow into without active
+   184	tokens). When retriever's #20 picks budgets for MS MARCO they will
+   185	have plenty of active tokens (n_j ≥ τ) and can use κ_total in the
+   186	hundreds-of-thousands range.
+   187	
+   188	## MLX path setup (post-hackathon plan-12)
+   189	
+   190	`tools/encode_mlx.py` is an additive Apple-Silicon-native re-port of
+   191	encode.py via Apple's MLX framework. The 4-gate parity contract in
+   192	`tests/live/mlx_parity.py` is **green** at both fp32 and fp16 on the
+   193	100-doc fixture, with gates 1+2 also confirmed on 1000 real Jira docs.
+   194	Encode.py remains the cross-platform canonical path; encode_mlx.py is
+   195	the fast Apple-Silicon option.
+   196	
+   197	### Dependencies
+   198	
+   199	Two extra packages on top of the pylate set, gated to darwin/arm64 in
+   200	`tools/requirements.txt`:
+   201	
+   202	```
+   203	mlx>=0.18; sys_platform == "darwin" and platform_machine == "arm64"
+   204	mlx-lm>=0.20; sys_platform == "darwin" and platform_machine == "arm64"
+   205	```
+   206	
+   207	mlx-lm currently pulls a newer `transformers` and `huggingface-hub`. We
+   208	re-pin transformers to `<5.0` afterwards so pylate's loader path keeps
+   209	working — pylate 1.4.0 was validated against transformers 4.x. If a
+   210	future mlx-lm hard-requires transformers 5.x, the MLX path moves into a
+   211	separate venv rather than dragging pylate forward.
+   212	
+   213	Verified pin set (May 2026):
+   214	
+   215	| package | version |
+   216	|---|---|
+   217	| mlx | 0.31.2 |
+   218	| mlx-lm | 0.31.3 |
+   219	| transformers | 4.57.6 |
+   220	| pylate | 1.4.0 |
+   221	| torch | 2.9.0 |
+   222	
+   223	### Provisioning
+   224	
+   225	```bash
+   226	uv pip install --python tools/.venv/bin/python -r tools/requirements.txt
+   227	# mlx-lm may briefly upgrade transformers; the requirements.txt
+   228	# transformers<5.0 pin restores it on a re-run.
+   229	uv pip install --python tools/.venv/bin/python "transformers>=4.40,<5.0"
+   230	```
+   231	
+   232	### Weight export
+   233	
+   234	`tools/export_colbert_to_mlx.py` walks the pylate state_dict (BERT base +
+   235	final linear projection) and writes
+   236	`tools/.cache/<model>/mlx_weights.safetensors`. Run once per model, then
+   237	`encode_mlx.py` mmaps the safetensors directly.
+   238	
+   239	### Running the parity harness
+   240	
+   241	After provisioning + weight export:
+   242	
+   243	```bash
+   244	zig build -Doptimize=ReleaseFast            # builds zig-out/bin/tac for gate 4
+   245	tools/.venv/bin/python tests/live/mlx_parity.py --mlx-parity --dtype fp16
+   246	```
+   247	
+   248	The script encodes the 100-doc fixture through both paths, parses the
+   249	resulting `tokens.bin` v2 + the `.tac` index format directly, and exits
+   250	non-zero on any gate failure. Default `zig build test` does NOT run this;
+   251	parity testing is opt-in via the `--mlx-parity` flag.
+   252	
+   253	### Parity gate results (100-doc fixture)
+   254	
+   255	PyTorch fp32 CPU baseline vs MLX fp32:
+   256	
+   257	| gate | result |
+   258	|---|---|
+   259	| 1. token-id byte equality                  | PASS — 1592 ids match exactly |
+   260	| 2. cosine ≥ 0.998 mean (≥ 0.99 min)        | PASS — mean 0.999998, min 0.999923, p1 0.999991 |
+
+exec
+/bin/zsh -lc "nl -ba tools/_tokens_bin.py | sed -n '1,260p'" in /Users/satan/side/experiments/ir-multivector-retrieval
+ succeeded in 0ms:
+     1	#!/usr/bin/env python3
+     2	"""tools/_tokens_bin.py — shared writer for the tokens.bin v2 format.
+     3	
+     4	Used by tools/encode.py (PyTorch path) and tools/encode_mlx.py (MLX path)
+     5	so both encoders produce byte-identical output. The format constants and
+     6	writer mirror src/io/token_dump.zig::parseBytes — any change here MUST
+     7	update the Zig parser in lockstep.
+     8	
+     9	This module is intentionally tiny and dependency-free (only stdlib) so
+    10	importing it does not pay the torch/pylate/mlx import cost. Both encoders
+    11	import this; no circular dep risk.
+    12	"""
+    13	from __future__ import annotations
+    14	
+    15	import datetime as _dt
+    16	import json
+    17	import struct
+    18	from dataclasses import dataclass
+    19	from pathlib import Path
+    20	
+    21	# Keep these in lockstep with src/io/token_dump.zig + src/constants.zig.
+    22	TOKEN_DUMP_MAGIC = b"TAC_TKN1"
+    23	TOKEN_DUMP_VERSION = 2  # v2 = real BERT vocab IDs
+    24	DTYPE_F32 = 0
+    25	HEADER_SIZE = 40  # magic(8) + version(4) + dim(4) + n_docs(8) + n_tokens(8) + dtype(1) + reserved(7)
+    26	MAX_DIM = 4096
+    27	
+    28	
+    29	@dataclass
+    30	class EncodedDoc:
+    31	    """Encoder-agnostic per-document output.
+    32	
+    33	    Both encode.py (pylate/torch) and encode_mlx.py (MLX) build this and
+    34	    hand it to write_tokens_bin. token_ids are real BERT vocabulary IDs;
+    35	    vectors are L2-normalised f32 row-major n_tokens × dim.
+    36	    """
+    37	
+    38	    doc_id: str
+    39	    token_ids: list[int]
+    40	    vectors: list[list[float]]
+    41	
+    42	
+    43	def write_tokens_bin(out_path: Path, encoded: list[EncodedDoc], dim: int) -> dict:
+    44	    """Write the flat binary in the on-disk format and return summary stats.
+    45	
+    46	    Byte layout (must match src/io/token_dump.zig::parseBytes):
+    47	      header (40B): magic(8) || version(u32 LE) || dim(u32 LE) ||
+    48	                    n_docs(u64 LE) || n_tokens(u64 LE) || dtype(u8) || zeros(7)
+    49	      doc_offsets[n_docs+1] u64 LE  (CSR)
+    50	      token_ids[n_tokens]   u32 LE
+    51	      vectors[n_tokens*dim] f32 LE  (row-major, L2-normalised)
+    52	    """
+    53	    n_docs = len(encoded)
+    54	    n_tokens = sum(len(d.token_ids) for d in encoded)
+    55	    if n_tokens == 0:
+    56	        raise SystemExit("aborting: 0 tokens after encoding")
+    57	
+    58	    doc_offsets = [0]
+    59	    for d in encoded:
+    60	        doc_offsets.append(doc_offsets[-1] + len(d.token_ids))
+    61	    assert doc_offsets[-1] == n_tokens
+    62	
+    63	    out_path.parent.mkdir(parents=True, exist_ok=True)
+    64	    with out_path.open("wb") as f:
+    65	        f.write(TOKEN_DUMP_MAGIC)
+    66	        f.write(struct.pack("<I", TOKEN_DUMP_VERSION))
+    67	        f.write(struct.pack("<I", dim))
+    68	        f.write(struct.pack("<Q", n_docs))
+    69	        f.write(struct.pack("<Q", n_tokens))
+    70	        f.write(struct.pack("<B", DTYPE_F32))
+    71	        f.write(b"\x00" * 7)
+    72	        assert f.tell() == HEADER_SIZE
+    73	
+    74	        for o in doc_offsets:
+    75	            f.write(struct.pack("<Q", o))
+    76	
+    77	        for d in encoded:
+    78	            for tid in d.token_ids:
+    79	                f.write(struct.pack("<I", int(tid)))
+    80	
+    81	        for d in encoded:
+    82	            for vec in d.vectors:
+    83	                if len(vec) != dim:
+    84	                    raise SystemExit(
+    85	                        f"internal: doc {d.doc_id!r} vector dim {len(vec)} != {dim}"
+    86	                    )
+    87	                for x in vec:
+    88	                    f.write(struct.pack("<f", float(x)))
+    89	
+    90	    return {"n_docs": n_docs, "n_tokens": n_tokens, "dim": dim}
+    91	
+    92	
+    93	def write_qids_sidecar(qids_path: Path, qid_strings: list[str]) -> None:
+    94	    """Flat little-endian u32 array, one entry per encoded query in CSR row
+    95	    order. The Zig bench harness mmaps it as `[]const u32` directly. qids
+    96	    must be integer-parseable (MS MARCO + LoTTE qualify)."""
+    97	    qids_path.parent.mkdir(parents=True, exist_ok=True)
+    98	    with qids_path.open("wb") as f:
+    99	        for q in qid_strings:
+   100	            try:
+   101	                qi = int(q)
+   102	            except ValueError as e:
+   103	                raise SystemExit(
+   104	                    f"qid {q!r} is not int-parseable; .qids sidecar requires "
+   105	                    "numeric qids (MS MARCO / LoTTE qualify)."
+   106	                ) from e
+   107	            if qi < 0 or qi > 0xFFFF_FFFF:
+   108	                raise SystemExit(
+   109	                    f"qid {qi} outside u32 range; .qids sidecar requires "
+   110	                    "0 <= qid <= 2^32-1."
+   111	                )
+   112	            f.write(struct.pack("<I", qi))
+   113	
+   114	
+   115	def write_metadata(
+   116	    meta_path: Path,
+   117	    *,
+   118	    mode: str,
+   119	    model_name: str,
+   120	    dim: int,
+   121	    n_docs: int,
+   122	    n_tokens: int,
+   123	    doc_ids: list[str],
+   124	    dropped: list[tuple[str, str]],
+   125	    docs_jsonl: Path,
+   126	    tool: str,
+   127	    tool_version: str,
+   128	) -> None:
+   129	    """Sidecar JSON describing the dump. `tool` + `tool_version` are
+   130	    parameterised so encode.py and encode_mlx.py can identify their
+   131	    output (e.g. `tools/encode.py` 0.3 vs `tools/encode_mlx.py` 0.1)."""
+   132	    is_query = mode == "queries"
+   133	    id_field = "qid" if is_query else "doc_id"
+   134	    map_field = "qid_map" if is_query else "doc_id_map"
+   135	    if is_query:
+   136	        notes = [
+   137	            "token_ids are real BERT vocabulary IDs from "
+   138	            "tokenizer(text, is_query=True)['input_ids']: the ColBERT [Q] "
+   139	            "prefix is preserved and ALL attended tokens are kept (no "
+   140	            "skiplist drop on the query side, per paper §5). Format v2.",
+   141	        ]
+   142	    else:
+   143	        notes = [
+   144	            "token_ids are real BERT vocabulary IDs from "
+   145	            "tokenizer(text)['input_ids'] with the ColBERT [D] prefix "
+   146	            "preserved and skiplist (punctuation) tokens dropped, exactly "
+   147	            "matching pylate.models.ColBERT.encode's keep-mask. Format v2.",
+   148	        ]
+   149	    meta = {
+   150	        "format_version": TOKEN_DUMP_VERSION,
+   151	        "mode": mode,
+   152	        "encoder": model_name,
+   153	        "encoder_dim": dim,
+   154	        "n_docs": n_docs,
+   155	        "n_tokens": n_tokens,
+   156	        map_field: doc_ids,
+   157	        "dropped": [{id_field: d, "reason": r} for d, r in dropped],
+   158	        "built_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+   159	        "tool": tool,
+   160	        "tool_version": tool_version,
+   161	        "source_jsonl": str(docs_jsonl),
+   162	        "notes": notes,
+   163	    }
+   164	    meta_path.parent.mkdir(parents=True, exist_ok=True)
+   165	    with meta_path.open("w", encoding="utf-8") as f:
+   166	        json.dump(meta, f, indent=2, ensure_ascii=False)
+   167	        f.write("\n")
+
+exec
+/bin/zsh -lc "nl -ba tools/LIVE_ENCODER_NOTES.md | sed -n '253,420p'" in /Users/satan/side/experiments/ir-multivector-retrieval
+ succeeded in 0ms:
+   253	### Parity gate results (100-doc fixture)
+   254	
+   255	PyTorch fp32 CPU baseline vs MLX fp32:
+   256	
+   257	| gate | result |
+   258	|---|---|
+   259	| 1. token-id byte equality                  | PASS — 1592 ids match exactly |
+   260	| 2. cosine ≥ 0.998 mean (≥ 0.99 min)        | PASS — mean 0.999998, min 0.999923, p1 0.999991 |
+   261	| 3. two-run MLX determinism                 | PASS — 203776 floats BYTE-IDENTICAL |
+   262	| 4. downstream TAC cluster overlap          | PASS — kappa=92 centroid cosine mean 0.999999, min 0.999997 |
+   263	
+   264	PyTorch fp32 CPU baseline vs MLX **fp16**:
+   265	
+   266	| gate | result |
+   267	|---|---|
+   268	| 1. token-id byte equality                  | PASS |
+   269	| 2. cosine ≥ 0.998 mean (≥ 0.99 min)        | PASS — mean 0.999999, min 0.999873, p1 0.999997 |
+   270	| 3. two-run MLX determinism                 | PASS — 203776 floats BYTE-IDENTICAL even at fp16 |
+   271	| 4. downstream TAC cluster overlap          | PASS — centroid cosine mean 0.999999, min 0.999998 |
+   272	
+   273	Cross-corpus spot-check on 1000 real Jira docs (gates 1 + 2 only):
+   274	
+   275	| gate | mlx-fp32 | mlx-fp16 |
+   276	|---|---|---|
+   277	| 1. token-id byte equality      | PASS (55202 ids) | PASS (55202 ids) |
+   278	| 2. cosine                      | mean 0.999997, min 0.999803 | mean 0.999998, min 0.999970 |
+   279	
+   280	Notable: **MLX is byte-deterministic across runs** at both fp32 and fp16
+   281	on Apple Silicon. encode.py under the current pin set (transformers 4.57)
+   282	is NOT — two back-to-back runs differ in ~99% of output floats with max
+   283	abs ~1.5e-6 (fp32 ε-class) because transformers' `mean_resizing` path
+   284	fires when pylate expands the BERT vocab to add ColBERT's `[D]` and
+   285	`[Q]` tokens, advancing the global RNG without seeding before any
+   286	forward pass. That drift is below the parity floor so it doesn't break
+   287	gate 2, but it does mean MLX is now the more reproducible backend.
+   288	
+   289	### Measured speedup
+   290	
+   291	End-to-end CLI wall-clock, back-to-back so HF cache + MLX kernels are warm:
+   292	
+   293	100-doc live fixture (1592 kept tokens, mostly short synthetic English):
+   294	
+   295	| invocation                                | wall   | speedup |
+   296	|-------------------------------------------|--------|---------|
+   297	| encode.py fp32 cpu, batch=32              | 11.48s | 1.00×   |
+   298	| encode_mlx.py fp32, batch=32              | 10.08s | 1.14×   |
+   299	| encode_mlx.py fp16, batch=32              |  7.97s | **1.44×** |
+   300	
+   301	1000-doc Jira subset (55202 kept tokens, avg ~2.7 kB per doc):
+   302	
+   303	| invocation                                | wall   | speedup |
+   304	|-------------------------------------------|--------|---------|
+   305	| encode.py fp32 cpu, batch=32              | 67.72s | 1.00×   |
+   306	| encode_mlx.py fp32, batch=32              | 19.52s | **3.47×** |
+   307	| encode_mlx.py fp16, batch=32              | 16.18s | **4.19×** |
+   308	
+   309	The 100-doc fixture is too small to amortize tokenizer + cold-start cost
+   310	(fixed overhead dominates wall). The 1000-doc Jira subset is closer to
+   311	real workloads and shows MLX's actual lever: ~3.5× at fp32, ~4.2× at fp16
+   312	over PyTorch's cpu fp32 path. Note we're NOT comparing against PyTorch
+   313	MPS fp16 — that path's separate measurements live in the
+   314	`### Measured speedup (Apple Silicon, jina-colbert-v2-64)` table above
+   315	(fp16 MPS at 9.6s on 100-doc, 90.18s on 1000-doc Jira; against those
+   316	numbers MLX is roughly comparable on tiny fixtures and ~5–6× on the Jira
+   317	subset).
+   318	
+   319	### Recommendation
+   320	
+   321	- Use `tools/encode.py` on cpu / cuda when reproducibility across machine
+   322	  classes matters more than encode wall-clock; it is the canonical path
+   323	  and what every benchmark we publish was measured on.
+   324	- Use `tools/encode_mlx.py` on Apple Silicon when encode wall-clock
+   325	  matters: it is parity-tested, byte-deterministic across runs, and
+   326	  ~3–4× faster than encode.py on cpu fp32 / 1000-doc real corpora.
+   327	  Token IDs are byte-identical and per-token cosine ≥ 0.9998 vs the
+   328	  pylate path, so downstream TAC indexing is interchangeable in
+   329	  practice (gate 4 confirmed centroid cosine ≥ 0.99999 at the live
+   330	  fixture's kappa=92 budget).
+   331	
+   332	## Failure modes worth flagging
+   333	
+   334	- If a future pylate revision breaks the `model.tokenize` →
+   335	  `model.forward` → `model.skiplist_mask` path inside
+   336	  `tools/encode.py::encode_docs`, you'll see one of:
+   337	  - `error: TestExpectedApproxEqAbs` in the live harness (vocab id ↔
+   338	    embedding row drift).
+   339	  - `n_j ≥ 2` ratio drops below 50 % (skiplist regression — punctuation
+   340	    leaking through with positional or duplicated ids).
+   341	- If the encoder dim drifts away from 128, `tac.cluster` still runs but
+   342	  PQ trainer (paper §4 with M=32) needs to be re-checked: dim must be
+   343	  divisible by M.
+
+exec
+/bin/zsh -lc "nl -ba tests/live/mlx_parity.py | sed -n '340,620p'" in /Users/satan/side/experiments/ir-multivector-retrieval
+ succeeded in 0ms:
+   340	    return True, msg
+   341	
+   342	
+   343	# ---------------------------------------------------------------------------
+   344	# Main
+   345	# ---------------------------------------------------------------------------
+   346	
+   347	
+   348	def parse_args() -> argparse.Namespace:
+   349	    p = argparse.ArgumentParser(description="MLX ↔ PyTorch parity for ColBERT encoder")
+   350	    p.add_argument(
+   351	        "--mlx-parity",
+   352	        action="store_true",
+   353	        required=True,
+   354	        help="opt-in flag — mirrors -Dlive=true (parity tests are off-by-default)",
+   355	    )
+   356	    p.add_argument("--max-docs", type=int, default=None, help="subset for fast runs")
+   357	    p.add_argument(
+   358	        "--dtype",
+   359	        choices=("fp32", "fp16"),
+   360	        default="fp16",
+   361	        help="encoder dtype on both sides (default fp16, matches MPS default)",
+   362	    )
+   363	    p.add_argument(
+   364	        "--kappa",
+   365	        type=int,
+   366	        default=92,
+   367	        help="tac index kappa for gate 4 (default 92, matches live harness)",
+   368	    )
+   369	    p.add_argument("--seed", type=int, default=2026, help="tac index seed")
+   370	    p.add_argument(
+   371	        "--out-dir",
+   372	        type=Path,
+   373	        default=Path("/tmp"),
+   374	        help="where to write the parity binaries",
+   375	    )
+   376	    p.add_argument(
+   377	        "--skip-gate4",
+   378	        action="store_true",
+   379	        help="skip downstream cluster-overlap gate (useful when zig build isn't ready)",
+   380	    )
+   381	    return p.parse_args()
+   382	
+   383	
+   384	def main() -> None:
+   385	    args = parse_args()
+   386	
+   387	    # Sanity: required files exist.
+   388	    for p in (FIXTURE, MLX_WEIGHTS, VENV_PY):
+   389	        if not p.exists():
+   390	            raise SystemExit(f"required path missing: {p}")
+   391	
+   392	    print(f"[parity] fixture: {FIXTURE} (max_docs={args.max_docs}) dtype={args.dtype}", flush=True)
+   393	
+   394	    pt_bin = args.out_dir / "parity_pt.bin"
+   395	    mlx_bin = args.out_dir / "parity_mlx.bin"
+   396	    mlx_a = args.out_dir / "parity_mlx_a.bin"
+   397	    mlx_b = args.out_dir / "parity_mlx_b.bin"
+   398	
+   399	    print("[parity] encoding via encode.py (pylate, cpu)…", flush=True)
+   400	    t_pt = encode_pt(pt_bin, args.max_docs, args.dtype if args.dtype == "fp32" else "fp32")
+   401	    # Note: encode.py on cpu doesn't accept fp16 the same way; we pass fp32 there.
+   402	    # MLX side runs at the requested dtype.
+   403	    print(f"[parity] encode.py: {t_pt:.2f}s", flush=True)
+   404	
+   405	    print(f"[parity] encoding via encode_mlx.py ({args.dtype})…", flush=True)
+   406	    t_mlx = encode_mlx(mlx_bin, args.max_docs, args.dtype)
+   407	    print(f"[parity] encode_mlx.py: {t_mlx:.2f}s (vs {t_pt:.2f}s pt → {t_pt/max(t_mlx, 1e-9):.2f}x)", flush=True)
+   408	
+   409	    pt = parse_tokens_bin(pt_bin)
+   410	    mlx = parse_tokens_bin(mlx_bin)
+   411	
+   412	    results: dict[str, tuple[bool, str]] = {}
+   413	
+   414	    print("[parity] gate 1: token-id byte equality")
+   415	    results["gate1_token_ids"] = gate1_token_ids(pt, mlx)
+   416	    print(f"  {'PASS' if results['gate1_token_ids'][0] else 'FAIL'}: {results['gate1_token_ids'][1]}")
+   417	
+   418	    # Gate 2 thresholds: when we compare fp32 PT vs fp{16,32} MLX the floors are 0.998 mean / 0.99 min.
+   419	    print("[parity] gate 2: per-token cosine")
+   420	    results["gate2_cosine"] = gate2_cosine(pt, mlx, mean_floor=0.998, min_floor=0.99)
+   421	    print(f"  {'PASS' if results['gate2_cosine'][0] else 'FAIL'}: {results['gate2_cosine'][1]}")
+   422	
+   423	    print(f"[parity] gate 3: two-run MLX determinism ({args.dtype})")
+   424	    results["gate3_determinism"] = gate3_determinism(mlx_a, mlx_b, args.max_docs, args.dtype)
+   425	    print(f"  {'PASS' if results['gate3_determinism'][0] else 'FAIL'}: {results['gate3_determinism'][1]}")
+   426	
+   427	    if args.skip_gate4:
+   428	        print("[parity] gate 4: skipped (--skip-gate4)")
+   429	        results["gate4_clustering"] = (True, "skipped via --skip-gate4")
+   430	    else:
+   431	        print(f"[parity] gate 4: TAC clustering overlap (kappa={args.kappa}, seed={args.seed})")
+   432	        try:
+   433	            results["gate4_clustering"] = gate4_clustering(pt_bin, mlx_bin, args.kappa, args.seed)
+   434	        except SystemExit as e:
+   435	            results["gate4_clustering"] = (False, f"gate4 setup failed: {e}")
+   436	        print(f"  {'PASS' if results['gate4_clustering'][0] else 'FAIL'}: {results['gate4_clustering'][1]}")
+   437	
+   438	    print()
+   439	    print("[parity] summary:")
+   440	    all_pass = True
+   441	    for name, (ok, msg) in results.items():
+   442	        status = "PASS" if ok else "FAIL"
+   443	        print(f"  {name}: {status}  {msg}")
+   444	        if not ok:
+   445	            all_pass = False
+   446	
+   447	    if not all_pass:
+   448	        sys.exit(2)
+   449	    print("[parity] all gates PASS")
+   450	
+   451	
+   452	if __name__ == "__main__":
+   453	    main()
+
+exec
+/bin/zsh -lc "nl -ba tools/export_colbert_to_mlx.py | sed -n '1,260p'" in /Users/satan/side/experiments/ir-multivector-retrieval
+ succeeded in 0ms:
+     1	#!/usr/bin/env python3
+     2	"""tools/export_colbert_to_mlx.py — convert pylate ColBERT weights to MLX.
+     3	
+     4	Owner: post-hackathon plan-12 (mlx-encoder-engineer).
+     5	
+     6	Loads `colbert-ir/colbertv2.0` (or `jinaai/jina-colbert-v2-64`) via pylate,
+     7	walks the underlying BERT base + the final pylate `Dense` linear projection,
+     8	and saves an MLX-safetensors file to
+     9	`tools/.cache/<model>/mlx_weights.safetensors`.
+    10	
+    11	The MLX encoder (tools/encode_mlx.py) hand-rolls the BERT forward pass via
+    12	`mlx.nn.Linear` + `mlx.nn.LayerNorm` etc. (mlx_lm has no encoder-only BERT
+    13	model class today). We rename the keys here so the MLX side can `mx.load`
+    14	the file directly into a flat dict and bind weights by name.
+    15	
+    16	Key rename map (pylate/sbert → MLX-encoder):
+    17	  0.auto_model.embeddings.word_embeddings.weight    → embeddings.word.weight
+    18	  0.auto_model.embeddings.position_embeddings.weight → embeddings.position.weight
+    19	  0.auto_model.embeddings.token_type_embeddings.weight → embeddings.token_type.weight
+    20	  0.auto_model.embeddings.LayerNorm.{weight,bias}   → embeddings.ln.{weight,bias}
+    21	  0.auto_model.encoder.layer.<i>.attention.self.{q,k,v}.{weight,bias}
+    22	                                                    → layers.<i>.attn.{q,k,v}.{weight,bias}
+    23	  0.auto_model.encoder.layer.<i>.attention.output.dense.{weight,bias}
+    24	                                                    → layers.<i>.attn.out.{weight,bias}
+    25	  0.auto_model.encoder.layer.<i>.attention.output.LayerNorm.{weight,bias}
+    26	                                                    → layers.<i>.attn.ln.{weight,bias}
+    27	  0.auto_model.encoder.layer.<i>.intermediate.dense.{weight,bias}
+    28	                                                    → layers.<i>.ff.up.{weight,bias}
+    29	  0.auto_model.encoder.layer.<i>.output.dense.{weight,bias}
+    30	                                                    → layers.<i>.ff.down.{weight,bias}
+    31	  0.auto_model.encoder.layer.<i>.output.LayerNorm.{weight,bias}
+    32	                                                    → layers.<i>.ff.ln.{weight,bias}
+    33	  1.linear.weight                                   → projection.weight
+    34	
+    35	The pylate.Dense projection has no bias on ColBERTv2 (`bias=False`), so
+    36	no projection.bias key is emitted. We assert this on export and store it
+    37	in the sidecar config so the MLX encoder builds a no-bias `nn.Linear`.
+    38	
+    39	Pooler weights (0.auto_model.pooler.*) are dropped — ColBERT token-level
+    40	outputs never go through the pooler. We log them as "intentionally
+    41	discarded" rather than failing.
+    42	
+    43	Output:
+    44	  tools/.cache/<model_safe>/mlx_weights.safetensors  -- flat key -> mx.array
+    45	  tools/.cache/<model_safe>/config.json              -- arch hyperparams
+    46	"""
+    47	from __future__ import annotations
+    48	
+    49	import argparse
+    50	import json
+    51	import re
+    52	import sys
+    53	from pathlib import Path
+    54	
+    55	
+    56	def _safe_name(model_name: str) -> str:
+    57	    """Filesystem-safe slug for cache subdirs (e.g. 'colbert-ir/colbertv2.0'
+    58	    → 'colbert-ir__colbertv2.0')."""
+    59	    return re.sub(r"[^a-zA-Z0-9._-]+", "__", model_name)
+    60	
+    61	
+    62	def parse_args() -> argparse.Namespace:
+    63	    p = argparse.ArgumentParser(description="Export ColBERT weights to MLX safetensors")
+    64	    p.add_argument(
+    65	        "--model",
+    66	        type=str,
+    67	        default="colbert-ir/colbertv2.0",
+    68	        help="HuggingFace model id (or local path) to load via pylate.",
+    69	    )
+    70	    p.add_argument(
+    71	        "--out-dir",
+    72	        type=Path,
+    73	        default=None,
+    74	        help=(
+    75	            "output directory. Defaults to tools/.cache/<safe_model_name>/. "
+    76	            "Files written: mlx_weights.safetensors + config.json."
+    77	        ),
+    78	    )
+    79	    p.add_argument(
+    80	        "--trust-remote-code",
+    81	        action="store_true",
+    82	        help="pass through to pylate.models.ColBERT (needed for jina models).",
+    83	    )
+    84	    p.add_argument(
+    85	        "--dtype",
+    86	        choices=("fp32", "fp16"),
+    87	        default="fp32",
+    88	        help=(
+    89	            "weight dtype to write to safetensors. fp32 keeps full precision; "
+    90	            "fp16 halves the file. The MLX encoder up-casts to the dtype "
+    91	            "selected at runtime, so this only affects on-disk size."
+    92	        ),
+    93	    )
+    94	    return p.parse_args()
+    95	
+    96	
+    97	def remap_key(k: str) -> str | None:
+    98	    """Map a pylate state_dict key to its MLX-encoder name. Returns None if
+    99	    the key is intentionally discarded (e.g. BERT pooler).
+   100	
+   101	    The mapping is exact: any unknown key triggers a SystemExit so we never
+   102	    silently drop something the MLX side relies on.
+   103	    """
+   104	    # pooler: present but unused for token-level ColBERT.
+   105	    if k.startswith("0.auto_model.pooler."):
+   106	        return None
+   107	
+   108	    # embeddings
+   109	    m = re.fullmatch(r"0\.auto_model\.embeddings\.(\w+)_embeddings\.weight", k)
+   110	    if m:
+   111	        return f"embeddings.{m.group(1)}.weight"
+   112	    m = re.fullmatch(r"0\.auto_model\.embeddings\.LayerNorm\.(weight|bias)", k)
+   113	    if m:
+   114	        return f"embeddings.ln.{m.group(1)}"
+   115	
+   116	    # encoder layers
+   117	    m = re.fullmatch(
+   118	        r"0\.auto_model\.encoder\.layer\.(\d+)\.attention\.self\.(query|key|value)\.(weight|bias)",
+   119	        k,
+   120	    )
+   121	    if m:
+   122	        idx, qkv, wb = m.groups()
+   123	        short = {"query": "q", "key": "k", "value": "v"}[qkv]
+   124	        return f"layers.{idx}.attn.{short}.{wb}"
+   125	
+   126	    m = re.fullmatch(
+   127	        r"0\.auto_model\.encoder\.layer\.(\d+)\.attention\.output\.dense\.(weight|bias)",
+   128	        k,
+   129	    )
+   130	    if m:
+   131	        return f"layers.{m.group(1)}.attn.out.{m.group(2)}"
+   132	
+   133	    m = re.fullmatch(
+   134	        r"0\.auto_model\.encoder\.layer\.(\d+)\.attention\.output\.LayerNorm\.(weight|bias)",
+   135	        k,
+   136	    )
+   137	    if m:
+   138	        return f"layers.{m.group(1)}.attn.ln.{m.group(2)}"
+   139	
+   140	    m = re.fullmatch(
+   141	        r"0\.auto_model\.encoder\.layer\.(\d+)\.intermediate\.dense\.(weight|bias)",
+   142	        k,
+   143	    )
+   144	    if m:
+   145	        return f"layers.{m.group(1)}.ff.up.{m.group(2)}"
+   146	
+   147	    m = re.fullmatch(
+   148	        r"0\.auto_model\.encoder\.layer\.(\d+)\.output\.dense\.(weight|bias)",
+   149	        k,
+   150	    )
+   151	    if m:
+   152	        return f"layers.{m.group(1)}.ff.down.{m.group(2)}"
+   153	
+   154	    m = re.fullmatch(
+   155	        r"0\.auto_model\.encoder\.layer\.(\d+)\.output\.LayerNorm\.(weight|bias)",
+   156	        k,
+   157	    )
+   158	    if m:
+   159	        return f"layers.{m.group(1)}.ff.ln.{m.group(2)}"
+   160	
+   161	    # final pylate Dense projection (768 -> 128)
+   162	    if k == "1.linear.weight":
+   163	        return "projection.weight"
+   164	    if k == "1.linear.bias":
+   165	        return "projection.bias"
+   166	
+   167	    raise SystemExit(f"unknown ColBERT state_dict key: {k!r} — refusing to silently drop")
+   168	
+   169	
+   170	def main() -> None:
+   171	    args = parse_args()
+   172	
+   173	    import mlx.core as mx  # noqa: E402
+   174	    import torch  # noqa: E402
+   175	    from pylate import models  # noqa: E402
+   176	
+   177	    print(f"loading {args.model} via pylate (CPU)…", file=sys.stderr)
+   178	    model = models.ColBERT(
+   179	        model_name_or_path=args.model,
+   180	        trust_remote_code=args.trust_remote_code,
+   181	        device="cpu",
+   182	    )
+   183	    model.eval()
+   184	
+   185	    # Pull the underlying HF BERT config out of the wrapped sentence-transformers
+   186	    # Transformer module. Layout: model[0].auto_model is the BERT model.
+   187	    bert = model[0].auto_model
+   188	    cfg = bert.config
+   189	    n_layers = cfg.num_hidden_layers
+   190	    hidden = cfg.hidden_size
+   191	    n_heads = cfg.num_attention_heads
+   192	    intermediate = cfg.intermediate_size
+   193	    vocab_size = cfg.vocab_size
+   194	    max_pos = cfg.max_position_embeddings
+   195	    type_vocab = cfg.type_vocab_size
+   196	    ln_eps = cfg.layer_norm_eps
+   197	    hidden_act = cfg.hidden_act
+   198	    if hidden_act != "gelu":
+   199	        # BERT base uses gelu; flag any drift so the MLX encoder doesn't
+   200	        # silently substitute the wrong activation.
+   201	        raise SystemExit(
+   202	            f"unexpected hidden activation {hidden_act!r}; MLX encoder is "
+   203	            "hard-coded for gelu."
+   204	        )
+   205	
+   206	    # pylate.Dense projection. ColBERTv2 uses bias=False; we assert and record.
+   207	    projection = model[1].linear
+   208	    proj_in, proj_out = projection.in_features, projection.out_features
+   209	    proj_has_bias = projection.bias is not None
+   210	    if proj_has_bias:
+   211	        # ColBERTv2 expects bias=False; if a future pylate bumps this we want to know.
+   212	        print(
+   213	            f"WARN: pylate Dense projection has bias=True (unusual for ColBERTv2)",
+   214	            file=sys.stderr,
+   215	        )
+   216	
+   217	    # Walk + remap state_dict.
+   218	    sd = model.state_dict()
+   219	    out_weights: dict[str, mx.array] = {}
+   220	    discarded: list[str] = []
+   221	
+   222	    target_dtype_torch = torch.float16 if args.dtype == "fp16" else torch.float32
+   223	    for k, v in sd.items():
+   224	        new_k = remap_key(k)
+   225	        if new_k is None:
+   226	            discarded.append(k)
+   227	            continue
+   228	        # Convert torch tensor → numpy → mlx (mx.array doesn't construct
+   229	        # directly from torch tensors). Cast first to the target dtype.
+   230	        t = v.detach().to(target_dtype_torch).contiguous().cpu().numpy()
+   231	        out_weights[new_k] = mx.array(t)
+   232	
+   233	    # Sanity: confirm we got every layer's full set of weights. Expected key
+   234	    # stems per layer:
+   235	    expected_per_layer = [
+   236	        "attn.q.weight", "attn.q.bias",
+   237	        "attn.k.weight", "attn.k.bias",
+   238	        "attn.v.weight", "attn.v.bias",
+   239	        "attn.out.weight", "attn.out.bias",
+   240	        "attn.ln.weight", "attn.ln.bias",
+   241	        "ff.up.weight", "ff.up.bias",
+   242	        "ff.down.weight", "ff.down.bias",
+   243	        "ff.ln.weight", "ff.ln.bias",
+   244	    ]
+   245	    for i in range(n_layers):
+   246	        for stem in expected_per_layer:
+   247	            full = f"layers.{i}.{stem}"
+   248	            if full not in out_weights:
+   249	                raise SystemExit(f"missing expected weight {full!r}")
+   250	
+   251	    embed_required = [
+   252	        "embeddings.word.weight",
+   253	        "embeddings.position.weight",
+   254	        "embeddings.token_type.weight",
+   255	        "embeddings.ln.weight",
+   256	        "embeddings.ln.bias",
+   257	        "projection.weight",
+   258	    ]
+   259	    for k in embed_required:
+   260	        if k not in out_weights:
+
+codex
+The parity harness is strong for token IDs, vector cosine, determinism, and TAC centroids, but it only times whole subprocesses and does not exercise query mode or pathological length distributions. I’m doing a targeted search for MLX-specific APIs and batching hooks before writing the ranked list.
+exec
+/bin/zsh -lc "rg -n \"fast|scaled_dot_product|compile|eval|batch|sort|query|mode|skiplist|numpy|tolist|mx\\.array|LayerNorm|gelu|softmax|tokenize|warmup|bf16|bfloat\" tools tests/live -S" in /Users/satan/side/experiments/ir-multivector-retrieval
+ succeeded in 0ms:
+tools/LIVE_ENCODER_NOTES.md:22:      --out tests/fixtures/live/tokens.bin --device cpu --batch 16
+tools/LIVE_ENCODER_NOTES.md:25:## Encoder dtype + batch size (post-hackathon plan 08)
+tools/LIVE_ENCODER_NOTES.md:31:| `--dtype` | fp32 | fp16 (`model.half()` after load) |
+tools/LIVE_ENCODER_NOTES.md:32:| `--encoder-batch-size` | 32 | 256 |
+tools/LIVE_ENCODER_NOTES.md:38:warmup pass on MPS so the first real batch isn't measuring Metal kernel
+tools/LIVE_ENCODER_NOTES.md:52:| fp32, encoder-batch-size 32                | 12.4 s | 1.00×   |
+tools/LIVE_ENCODER_NOTES.md:53:| fp16, encoder-batch-size 256               |  9.6 s | 1.29×   |
+tools/LIVE_ENCODER_NOTES.md:55:Encode-loop only (model already loaded, includes warmup, excludes load):
+tools/LIVE_ENCODER_NOTES.md:63:this hardware / model: the live fixture is too small to saturate the GPU
+tools/LIVE_ENCODER_NOTES.md:64:(model load dominates wall-clock), and on the longer Jira docs the
+tools/LIVE_ENCODER_NOTES.md:67:corpus + a larger ColBERT model where the matmuls dominate.
+tools/LIVE_ENCODER_NOTES.md:95:| encode wall-clock| ~20 s on Apple Silicon CPU (single batch)  |
+tools/LIVE_ENCODER_NOTES.md:99:After applying ColBERT's keep-mask (skiplist drops punctuation; CLS, [D]
+tools/LIVE_ENCODER_NOTES.md:129:   query also produces them, but be aware that their centroids will sit
+tools/LIVE_ENCODER_NOTES.md:195:the fast Apple-Silicon option.
+tools/LIVE_ENCODER_NOTES.md:236:`tools/.cache/<model>/mlx_weights.safetensors`. Run once per model, then
+tools/LIVE_ENCODER_NOTES.md:297:| encode.py fp32 cpu, batch=32              | 11.48s | 1.00×   |
+tools/LIVE_ENCODER_NOTES.md:298:| encode_mlx.py fp32, batch=32              | 10.08s | 1.14×   |
+tools/LIVE_ENCODER_NOTES.md:299:| encode_mlx.py fp16, batch=32              |  7.97s | **1.44×** |
+tools/LIVE_ENCODER_NOTES.md:305:| encode.py fp32 cpu, batch=32              | 67.72s | 1.00×   |
+tools/LIVE_ENCODER_NOTES.md:306:| encode_mlx.py fp32, batch=32              | 19.52s | **3.47×** |
+tools/LIVE_ENCODER_NOTES.md:307:| encode_mlx.py fp16, batch=32              | 16.18s | **4.19×** |
+tools/LIVE_ENCODER_NOTES.md:309:The 100-doc fixture is too small to amortize tokenizer + cold-start cost
+tools/LIVE_ENCODER_NOTES.md:326:  ~3–4× faster than encode.py on cpu fp32 / 1000-doc real corpora.
+tools/LIVE_ENCODER_NOTES.md:332:## Failure modes worth flagging
+tools/LIVE_ENCODER_NOTES.md:334:- If a future pylate revision breaks the `model.tokenize` →
+tools/LIVE_ENCODER_NOTES.md:335:  `model.forward` → `model.skiplist_mask` path inside
+tools/LIVE_ENCODER_NOTES.md:339:  - `n_j ≥ 2` ratio drops below 50 % (skiplist regression — punctuation
+tools/requirements.txt:6:# encoder model.
+tools/_tokens_bin.py:94:    """Flat little-endian u32 array, one entry per encoded query in CSR row
+tools/_tokens_bin.py:118:    mode: str,
+tools/_tokens_bin.py:119:    model_name: str,
+tools/_tokens_bin.py:132:    is_query = mode == "queries"
+tools/_tokens_bin.py:133:    id_field = "qid" if is_query else "doc_id"
+tools/_tokens_bin.py:134:    map_field = "qid_map" if is_query else "doc_id_map"
+tools/_tokens_bin.py:135:    if is_query:
+tools/_tokens_bin.py:138:            "tokenizer(text, is_query=True)['input_ids']: the ColBERT [Q] "
+tools/_tokens_bin.py:140:            "skiplist drop on the query side, per paper §5). Format v2.",
+tools/_tokens_bin.py:145:            "tokenizer(text)['input_ids'] with the ColBERT [D] prefix "
+tools/_tokens_bin.py:146:            "preserved and skiplist (punctuation) tokens dropped, exactly "
+tools/_tokens_bin.py:147:            "matching pylate.models.ColBERT.encode's keep-mask. Format v2.",
+tools/_tokens_bin.py:151:        "mode": mode,
+tools/_tokens_bin.py:152:        "encoder": model_name,
+tests/live/vocab_aliasing.zig:19://!       --out tests/fixtures/live/tokens.bin --device cpu --batch 16
+tests/live/mlx_parity.py:24:  --max-docs     subset for fast smoke runs (default: all 100 fixture docs)
+tests/live/mlx_parity.py:198:        "--batch", "16",
+tests/live/mlx_parity.py:213:        "--batch", "32",
+tests/live/mlx_parity.py:252:    cos_sorted = sorted(cos)
+tests/live/mlx_parity.py:255:    cmin = cos_sorted[0]
+tests/live/mlx_parity.py:256:    p1 = cos_sorted[max(0, n // 100)]
+tests/live/mlx_parity.py:259:        f"max={cos_sorted[-1]:.6f} (n={n})"
+tests/live/mlx_parity.py:356:    p.add_argument("--max-docs", type=int, default=None, help="subset for fast runs")
+tools/export_colbert_to_mlx.py:9:`tools/.cache/<model>/mlx_weights.safetensors`.
+tools/export_colbert_to_mlx.py:12:`mlx.nn.Linear` + `mlx.nn.LayerNorm` etc. (mlx_lm has no encoder-only BERT
+tools/export_colbert_to_mlx.py:13:model class today). We rename the keys here so the MLX side can `mx.load`
+tools/export_colbert_to_mlx.py:17:  0.auto_model.embeddings.word_embeddings.weight    → embeddings.word.weight
+tools/export_colbert_to_mlx.py:18:  0.auto_model.embeddings.position_embeddings.weight → embeddings.position.weight
+tools/export_colbert_to_mlx.py:19:  0.auto_model.embeddings.token_type_embeddings.weight → embeddings.token_type.weight
+tools/export_colbert_to_mlx.py:20:  0.auto_model.embeddings.LayerNorm.{weight,bias}   → embeddings.ln.{weight,bias}
+tools/export_colbert_to_mlx.py:21:  0.auto_model.encoder.layer.<i>.attention.self.{q,k,v}.{weight,bias}
+tools/export_colbert_to_mlx.py:23:  0.auto_model.encoder.layer.<i>.attention.output.dense.{weight,bias}
+tools/export_colbert_to_mlx.py:25:  0.auto_model.encoder.layer.<i>.attention.output.LayerNorm.{weight,bias}
+tools/export_colbert_to_mlx.py:27:  0.auto_model.encoder.layer.<i>.intermediate.dense.{weight,bias}
+tools/export_colbert_to_mlx.py:29:  0.auto_model.encoder.layer.<i>.output.dense.{weight,bias}
+tools/export_colbert_to_mlx.py:31:  0.auto_model.encoder.layer.<i>.output.LayerNorm.{weight,bias}
+tools/export_colbert_to_mlx.py:39:Pooler weights (0.auto_model.pooler.*) are dropped — ColBERT token-level
+tools/export_colbert_to_mlx.py:44:  tools/.cache/<model_safe>/mlx_weights.safetensors  -- flat key -> mx.array
+tools/export_colbert_to_mlx.py:45:  tools/.cache/<model_safe>/config.json              -- arch hyperparams
+tools/export_colbert_to_mlx.py:56:def _safe_name(model_name: str) -> str:
+tools/export_colbert_to_mlx.py:59:    return re.sub(r"[^a-zA-Z0-9._-]+", "__", model_name)
+tools/export_colbert_to_mlx.py:65:        "--model",
+tools/export_colbert_to_mlx.py:68:        help="HuggingFace model id (or local path) to load via pylate.",
+tools/export_colbert_to_mlx.py:75:            "output directory. Defaults to tools/.cache/<safe_model_name>/. "
+tools/export_colbert_to_mlx.py:82:        help="pass through to pylate.models.ColBERT (needed for jina models).",
+tools/export_colbert_to_mlx.py:105:    if k.startswith("0.auto_model.pooler."):
+tools/export_colbert_to_mlx.py:109:    m = re.fullmatch(r"0\.auto_model\.embeddings\.(\w+)_embeddings\.weight", k)
+tools/export_colbert_to_mlx.py:112:    m = re.fullmatch(r"0\.auto_model\.embeddings\.LayerNorm\.(weight|bias)", k)
+tools/export_colbert_to_mlx.py:118:        r"0\.auto_model\.encoder\.layer\.(\d+)\.attention\.self\.(query|key|value)\.(weight|bias)",
+tools/export_colbert_to_mlx.py:123:        short = {"query": "q", "key": "k", "value": "v"}[qkv]
+tools/export_colbert_to_mlx.py:127:        r"0\.auto_model\.encoder\.layer\.(\d+)\.attention\.output\.dense\.(weight|bias)",
+tools/export_colbert_to_mlx.py:134:        r"0\.auto_model\.encoder\.layer\.(\d+)\.attention\.output\.LayerNorm\.(weight|bias)",
+tools/export_colbert_to_mlx.py:141:        r"0\.auto_model\.encoder\.layer\.(\d+)\.intermediate\.dense\.(weight|bias)",
+tools/export_colbert_to_mlx.py:148:        r"0\.auto_model\.encoder\.layer\.(\d+)\.output\.dense\.(weight|bias)",
+tools/export_colbert_to_mlx.py:155:        r"0\.auto_model\.encoder\.layer\.(\d+)\.output\.LayerNorm\.(weight|bias)",
+tools/export_colbert_to_mlx.py:175:    from pylate import models  # noqa: E402
+tools/export_colbert_to_mlx.py:177:    print(f"loading {args.model} via pylate (CPU)…", file=sys.stderr)
+tools/export_colbert_to_mlx.py:178:    model = models.ColBERT(
+tools/export_colbert_to_mlx.py:179:        model_name_or_path=args.model,
+tools/export_colbert_to_mlx.py:183:    model.eval()
+tools/export_colbert_to_mlx.py:186:    # Transformer module. Layout: model[0].auto_model is the BERT model.
+tools/export_colbert_to_mlx.py:187:    bert = model[0].auto_model
+tools/export_colbert_to_mlx.py:198:    if hidden_act != "gelu":
+tools/export_colbert_to_mlx.py:199:        # BERT base uses gelu; flag any drift so the MLX encoder doesn't
+tools/export_colbert_to_mlx.py:203:            "hard-coded for gelu."
+tools/export_colbert_to_mlx.py:207:    projection = model[1].linear
+tools/export_colbert_to_mlx.py:218:    sd = model.state_dict()
+tools/export_colbert_to_mlx.py:219:    out_weights: dict[str, mx.array] = {}
+tools/export_colbert_to_mlx.py:228:        # Convert torch tensor → numpy → mlx (mx.array doesn't construct
+tools/export_colbert_to_mlx.py:230:        t = v.detach().to(target_dtype_torch).contiguous().cpu().numpy()
+tools/export_colbert_to_mlx.py:231:        out_weights[new_k] = mx.array(t)
+tools/export_colbert_to_mlx.py:265:        Path(__file__).resolve().parent / ".cache" / _safe_name(args.model)
+tools/export_colbert_to_mlx.py:276:        "model_name": args.model,
+tools/encode.py:8:fields), encodes each document with a ColBERT-style model (default
+tools/encode.py:23:        --model  colbert-ir/colbertv2.0 \\
+tools/encode.py:25:        --batch  16
+tools/encode.py:27:The model defaults to `colbert-ir/colbertv2.0` to match the paper. A
+tools/encode.py:29:identically through the same pylate path; pass `--model` (with
+tools/encode.py:32:We bypass `pylate.models.ColBERT.encode` because that wrapper does not
+tools/encode.py:34:Instead we drive `model.tokenize` → `model.forward` → `model.skiplist_mask`
+tools/encode.py:37:`pylate/models/colbert.py::encode` (lines ~688–720) one-for-one so the
+tools/encode.py:38:emitted vectors are byte-identical to what `model.encode` would have
+tools/encode.py:41:Determinism: pylate/transformers pin model weights by revision; the
+tools/encode.py:42:output bytes for a given (model, revision, doc list) are reproducible
+tools/encode.py:85:        "--mode",
+tools/encode.py:89:            "encoding mode (default: docs). queries mode adds [Q] prefix via "
+tools/encode.py:90:            "is_query=True and skips the skiplist drop so all query tokens "
+tools/encode.py:99:            "path to input JSONL. In docs mode each line needs {doc_id, text}. "
+tools/encode.py:100:            "In queries mode each line needs {qid, text}."
+tools/encode.py:105:        "--model",
+tools/encode.py:108:        help="ColBERT model name (HuggingFace ID or local path)",
+tools/encode.py:117:        "--batch",
+tools/encode.py:121:            "encoder batch size (legacy flag). New code should prefer "
+tools/encode.py:122:            "--encoder-batch-size, which overrides this when set."
+tools/encode.py:131:            "model.half() after load (4-6x faster on Apple Silicon MPS, "
+tools/encode.py:140:        "--encoder-batch-size",
+tools/encode.py:144:            "encoder forward batch (overrides --batch when set). "
+tools/encode.py:146:            "batches amortize pad cost and saturate the GPU; matches "
+tools/encode.py:159:        help="pass through to pylate.models.ColBERT (needed for jina models)",
+tools/encode.py:168:        "--sort-by-length",
+tools/encode.py:171:            "sort docs by tokenizer length before batching. Reduces padding "
+tools/encode.py:173:            "tokenize pass. Encoded order is restored at write time so "
+tools/encode.py:180:def read_docs_jsonl(path: Path, max_docs: int | None, mode: str) -> list[dict]:
+tools/encode.py:181:    """Load JSONL records. In `docs` mode each line is `{doc_id, text}`;
+tools/encode.py:182:    in `queries` mode each line is `{qid, text}`. The id key is normalised to
+tools/encode.py:185:    id_key = "doc_id" if mode == "docs" else "qid"
+tools/encode.py:200:            # Normalise: downstream uses obj["doc_id"]; in queries mode that
+tools/encode.py:202:            if mode == "queries":
+tools/encode.py:213:    mode: str,
+tools/encode.py:214:    model_name: str,
+tools/encode.py:216:    batch_size: int,
+tools/encode.py:218:    sort_by_length: bool = False,
+tools/encode.py:225:    Per-doc shape contract (mirrors `pylate.models.ColBERT.encode` for
+tools/encode.py:226:    is_query=False, normalize=True):
+tools/encode.py:227:        features = model.tokenize(texts, is_query=False)
+tools/encode.py:231:        out = model.forward(features)
+tools/encode.py:234:        skip = model.skiplist_mask(features["input_ids"], model.skiplist)
+tools/encode.py:245:    from pylate import models  # type: ignore
+tools/encode.py:247:    model = models.ColBERT(
+tools/encode.py:248:        model_name_or_path=model_name,
+tools/encode.py:252:    model.eval()
+tools/encode.py:261:        model.half()
+tools/encode.py:268:    is_query = mode == "queries"
+tools/encode.py:270:    # Metal compiles kernels on first use — without this 4-doc warmup the
+tools/encode.py:271:    # first real batch eats 1-3 s of kernel compile and skews bench. Skip
+tools/encode.py:272:    # on cpu where there are no kernels to compile.
+tools/encode.py:274:        warmup_texts = [d["text"] for d in docs[:4]] or ["warmup"]
+tools/encode.py:276:            warm_features = model.tokenize(warmup_texts, is_query=is_query)
+tools/encode.py:282:                model.forward(input=warm_features)
+tools/encode.py:285:            print(f"warmup pass failed (continuing): {e!r}", file=sys.stderr)
+tools/encode.py:287:    # Optional length-sort: encode docs in tokenizer-length order so each
+tools/encode.py:288:    # batch pads to its own longest member rather than the global longest.
+tools/encode.py:292:    if sort_by_length:
+tools/encode.py:293:        # Use a cheap proxy: character length. The model.tokenize call would
+tools/encode.py:294:        # be more accurate but doubles the tokenize cost; char length
+tools/encode.py:295:        # correlates well enough on natural text for batch packing.
+tools/encode.py:296:        encode_order = sorted(range(len(docs)), key=lambda i: len(docs[i]["text"]))
+tools/encode.py:298:        print(f"sorted {len(docs)} docs by char length for tighter batches", file=sys.stderr)
+tools/encode.py:303:    sorted_to_input: list[int] = encode_order
+tools/encode.py:305:    for batch_start in range(0, len(docs), batch_size):
+tools/encode.py:306:        batch = docs[batch_start : batch_start + batch_size]
+tools/encode.py:307:        texts = [d["text"] for d in batch]
+tools/encode.py:309:            features = model.tokenize(texts, is_query=is_query)
+tools/encode.py:315:                out = model.forward(input=features)
+tools/encode.py:319:            if is_query:
+tools/encode.py:320:                # paper §5: queries keep all attended tokens (no skiplist drop)
+tools/encode.py:322:                # pylate also pads queries to a fixed max_query_length; the
+tools/encode.py:326:                skip = model.skiplist_mask(
+tools/encode.py:327:                    input_ids=input_ids, skiplist=model.skiplist
+tools/encode.py:331:            for d in batch:
+tools/encode.py:332:                dropped.append((str(d["doc_id"]), f"batch encode failed: {e!r}"))
+tools/encode.py:335:        for b, d in enumerate(batch):
+tools/encode.py:338:                kept_ids = input_ids[b][kept_mask].detach().cpu().tolist()
+tools/encode.py:380:                        vectors=kept_emb.tolist(),
+tools/encode.py:389:    # Restore input-order if we sorted. Build a doc_id → encoded slot map
+tools/encode.py:391:    if sort_by_length:
+tools/encode.py:393:        # `sorted_to_input` holds input-side indices in tokenize-batch order;
+tools/encode.py:396:        # original `docs` list captured pre-sort isn't visible here — instead
+tools/encode.py:397:        # we sort `encoded` by the dict insertion of doc_ids by input index.
+tools/encode.py:398:        # Simpler: sort `encoded` by the position of its doc_id in the
+tools/encode.py:399:        # *post-sort* order, then invert that permutation.
+tools/encode.py:400:        # In practice the cleanest path is: sort `encoded` by an input-order
+tools/encode.py:406:        _ = sorted_to_input
+tools/encode.py:413:    mode: str,
+tools/encode.py:414:    model_name: str,
+tools/encode.py:426:        mode=mode,
+tools/encode.py:427:        model_name=model_name,
+tools/encode.py:442:    docs = read_docs_jsonl(args.docs, args.max_docs, args.mode)
+tools/encode.py:445:    noun = "queries" if args.mode == "queries" else "docs"
+tools/encode.py:448:    # Resolve auto-defaults for dtype + encoder batch size based on device.
+tools/encode.py:451:    # --encoder-batch-size overrides --batch when set; otherwise on cpu/cuda
+tools/encode.py:452:    # we fall back to --batch (preserving today's behavior with --batch 16).
+tools/encode.py:458:    if args.encoder_batch_size is not None:
+tools/encode.py:459:        encoder_batch = args.encoder_batch_size
+tools/encode.py:461:        encoder_batch = 256
+tools/encode.py:463:        encoder_batch = args.batch
+tools/encode.py:467:        mode=args.mode,
+tools/encode.py:468:        model_name=args.model,
+tools/encode.py:470:        batch_size=encoder_batch,
+tools/encode.py:472:        sort_by_length=args.sort_by_length,
+tools/encode.py:490:        mode=args.mode,
+tools/encode.py:491:        model_name=args.model,
+tools/encode.py:501:    if args.mode == "queries":
+tools/encode_mlx.py:9:Reuses the HuggingFace tokenizer via pylate's `model.tokenize` (HF
+tools/encode_mlx.py:10:tokenizers are deterministic CPU code, fast, and the only way to get
+tools/encode_mlx.py:19:        --model  colbert-ir/colbertv2.0 \\
+tools/encode_mlx.py:47:        "--model",
+tools/encode_mlx.py:50:        help="ColBERT model name (HuggingFace ID or local path); used for tokenizer + skiplist",
+tools/encode_mlx.py:58:            "Defaults to tools/.cache/<safe_model>/mlx_weights.safetensors. "
+tools/encode_mlx.py:69:        "--batch", type=int, default=32, help="docs per forward pass batch"
+tools/encode_mlx.py:77:        help="pass through to pylate.models.ColBERT for tokenizer load (jina models)",
+tools/encode_mlx.py:108:        self.ln = nn.LayerNorm(hidden)
+tools/encode_mlx.py:110:    def __call__(self, x: mx.array, attn_bias: mx.array) -> mx.array:
+tools/encode_mlx.py:123:        attn = mx.softmax(scores, axis=-1)
+tools/encode_mlx.py:132:    """Position-wise FFN: up-project (gelu) → down-project → residual + LN."""
+tools/encode_mlx.py:138:        self.ln = nn.LayerNorm(hidden)
+tools/encode_mlx.py:140:    def __call__(self, x: mx.array) -> mx.array:
+tools/encode_mlx.py:142:        h = nn.gelu(h)
+tools/encode_mlx.py:153:    def __call__(self, x: mx.array, attn_bias: mx.array) -> mx.array:
+tools/encode_mlx.py:165:        self.ln = nn.LayerNorm(hidden)
+tools/encode_mlx.py:167:    def __call__(self, input_ids: mx.array, token_type_ids: mx.array) -> mx.array:
+tools/encode_mlx.py:170:        # broadcast pos_ids over batch
+tools/encode_mlx.py:202:        input_ids: mx.array,
+tools/encode_mlx.py:203:        attention_mask: mx.array,
+tools/encode_mlx.py:204:        token_type_ids: mx.array,
+tools/encode_mlx.py:205:    ) -> mx.array:
+tools/encode_mlx.py:206:        # attention bias: 0 where mask=1, -inf where mask=0 (so softmax→0).
+tools/encode_mlx.py:207:        # shape: [B, 1, 1, T] to broadcast over (n_heads, query_seq).
+tools/encode_mlx.py:225:def _load_weights_into_model(model: ColBertMLX, weights: dict) -> None:
+tools/encode_mlx.py:245:    n_layers = model.cfg["n_layers"]
+tools/encode_mlx.py:288:    model.update(params)
+tools/encode_mlx.py:320:    model_name: str,
+tools/encode_mlx.py:323:    batch_size: int,
+tools/encode_mlx.py:328:    Tokenizer + skiplist come from pylate (CPU, deterministic, fast).
+tools/encode_mlx.py:330:    (skiplist & attention_mask), exactly as encode.py does.
+tools/encode_mlx.py:332:    # Tokenizer comes from pylate. We don't run model.forward through pylate
+tools/encode_mlx.py:333:    # — only model.tokenize and model.skiplist_mask.
+tools/encode_mlx.py:334:    from pylate import models  # type: ignore
+tools/encode_mlx.py:336:    pl = models.ColBERT(
+tools/encode_mlx.py:337:        model_name_or_path=model_name,
+tools/encode_mlx.py:341:    pl.eval()
+tools/encode_mlx.py:342:    skiplist = pl.skiplist  # list[int]
+tools/encode_mlx.py:359:    model = ColBertMLX(cfg)
+tools/encode_mlx.py:360:    _load_weights_into_model(model, weights)
+tools/encode_mlx.py:361:    model.eval()
+tools/encode_mlx.py:363:    skip_set = set(int(s) for s in skiplist)
+tools/encode_mlx.py:369:    for batch_start in range(0, len(docs), batch_size):
+tools/encode_mlx.py:370:        batch = docs[batch_start : batch_start + batch_size]
+tools/encode_mlx.py:371:        texts = [d["text"] for d in batch]
+tools/encode_mlx.py:373:            features = pl.tokenize(texts, is_query=False)
+tools/encode_mlx.py:378:                # If absent (some tokenizers), default to zeros.
+tools/encode_mlx.py:383:            input_ids = mx.array(input_ids_pt.cpu().numpy().astype("int32"))
+tools/encode_mlx.py:384:            attn = mx.array(attn_pt.cpu().numpy().astype("int32"))
+tools/encode_mlx.py:385:            type_ids = mx.array(type_ids_pt.cpu().numpy().astype("int32"))
+tools/encode_mlx.py:387:            tok_emb = model(input_ids, attn, type_ids)  # [B, T, dim]
+tools/encode_mlx.py:388:            # Force evaluation so we have concrete arrays for slicing.
+tools/encode_mlx.py:389:            mx.eval(tok_emb)
+tools/encode_mlx.py:391:            for d in batch:
+tools/encode_mlx.py:392:                dropped.append((str(d["doc_id"]), f"batch encode failed: {e!r}"))
+tools/encode_mlx.py:395:        # Apply keep mask (skiplist & attention_mask) per row.
+tools/encode_mlx.py:396:        ids_np = input_ids_pt.cpu().numpy()
+tools/encode_mlx.py:397:        attn_np = attn_pt.cpu().numpy()
+tools/encode_mlx.py:399:        # mlx.array → host: prefer mx.eval + .tolist or numpy() if available
+tools/encode_mlx.py:401:            import numpy as np  # noqa: F401
+tools/encode_mlx.py:403:            emb_arr = mx.eval(emb_np)
+tools/encode_mlx.py:405:            import numpy as np
+tools/encode_mlx.py:409:            import numpy as np
+tools/encode_mlx.py:411:            emb_arr = np.array(emb_np.tolist(), dtype=np.float32)
+tools/encode_mlx.py:413:        for b, d in enumerate(batch):
+tools/encode_mlx.py:428:                vectors = kept_emb.astype("float32").tolist()
+tools/encode_mlx.py:451:            Path(__file__).resolve().parent / ".cache" / _safe_name(args.model) / "mlx_weights.safetensors"
+tools/encode_mlx.py:461:        model_name=args.model,
+tools/encode_mlx.py:464:        batch_size=args.batch,
+tools/encode_mlx.py:482:        mode="docs",
+tools/encode_mlx.py:483:        model_name=args.model,
+
+exec
+/bin/zsh -lc "rg --files | rg 'requirements|pyproject|uv.lock|mlx|LIVE|encode'" in /Users/satan/side/experiments/ir-multivector-retrieval
+ succeeded in 0ms:
+tools/LIVE_ENCODER_NOTES.md
+tools/encode_mlx.py
+tools/requirements.txt
+tools/export_colbert_to_mlx.py
+tools/encode.py
+tests/live/mlx_parity.py
+
+exec
+/bin/zsh -lc "python - <<'PY'
+import mlx.core as mx
+print('mlx', getattr(mx,'__version__', 'unknown'))
+print('has compile', hasattr(mx,'compile'))
+print('has fast', hasattr(mx,'fast'))
+if hasattr(mx,'fast'):
+    print([n for n in dir(mx.fast) if 'attention' in n.lower() or 'scaled' in n.lower()])
+print('has bfloat16', hasattr(mx,'bfloat16'))
+PY" in /Users/satan/side/experiments/ir-multivector-retrieval
+ exited -1 in 0ms:
+Error:   × Main thread panicked.
+  ├─▶ at /Users/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/
+  │   system-configuration-0.6.1/src/dynamic_store.rs:154:1
+  ╰─▶ Attempted to create a NULL object.
+  help: set the `RUST_BACKTRACE=1` environment variable to display a
+        backtrace.
+
+
+exec
+/bin/zsh -lc "tools/.venv/bin/python - <<'PY'
+import mlx
+import mlx.core as mx
+print('mlx', getattr(mlx,'__version__', 'unknown'))
+print('has compile', hasattr(mx,'compile'))
+print('has fast', hasattr(mx,'fast'))
+if hasattr(mx,'fast'):
+    print([n for n in dir(mx.fast) if 'attention' in n.lower() or 'scaled' in n.lower()])
+print('has bfloat16', hasattr(mx,'bfloat16'))
+PY" in /Users/satan/side/experiments/ir-multivector-retrieval
+ succeeded in 0ms:
+mlx unknown
+has compile True
+has fast True
+['scaled_dot_product_attention']
+has bfloat16 True
+Exception ignored in atexit callback <nanobind.nb_func object at 0x103326790>:
+RuntimeError: [metal::load_device] No Metal device available. This typically occurs in headless, sandboxed, or virtualized macOS sessions where the GPU is not accessible.
+
+exec
+/bin/zsh -lc "tools/.venv/bin/python - <<'PY'
+import mlx.core as mx
+import inspect
+for obj,name in [(mx.fast.scaled_dot_product_attention,'sdpa'),(mx.compile,'compile')]:
+    print('\\n', name)
+    try:
+        print(inspect.signature(obj))
+    except Exception as e:
+        print('sig err', e)
+    doc = getattr(obj,'__doc__', '') or ''
+    print(doc[:1200])
+PY" in /Users/satan/side/experiments/ir-multivector-retrieval
+ succeeded in 0ms:
+
+ sdpa
+(*args, **kwargs)
+scaled_dot_product_attention(q: array, k: array, v: array, *, scale: float,  mask: Union[None, str, array] = None, sinks: Optional[array] = None, stream: Union[None, Stream, Device] = None) -> array
+
+        A fast implementation of multi-head attention: ``O = softmax(Q @ K.T, dim=-1) @ V``.
+
+        Supports:
+
+        * `Multi-Head Attention <https://arxiv.org/abs/1706.03762>`_
+        * `Grouped Query Attention <https://arxiv.org/abs/2305.13245>`_
+        * `Multi-Query Attention <https://arxiv.org/abs/1911.02150>`_
+
+        .. note::
+
+          * The softmax operation is performed in ``float32`` regardless of
+            the input precision.
+          * For Grouped Query Attention and Multi-Query Attention, the ``k``
+            and ``v`` inputs should not be pre-tiled to match ``q``.
+
+        In the following the dimensions are given by:
+
+        * ``B``: The batch size.
+        * ``N_q``: The number of query heads.
+        * ``N_kv``: The number of key and value heads.
+        * ``T_q``: The number of queries per example.
+        * ``T_kv``: The number of keys and values per example.
+        * ``D``: The per-head dimension.
+
+        Args:
+            q (array): Queries with sh
+
+ compile
+(*args, **kwargs)
+compile(fun: Callable[P, R], inputs: Optional[object] = None, outputs: Optional[object] = None, shapeless: bool = False) -> Callable[P, R]
+
+        Returns a compiled function which produces the same output as ``fun``.
+
+        Args:
+            fun (Callable): A function which takes a variable number of
+              :class:`array` or trees of :class:`array` and returns
+              a variable number of :class:`array` or trees of :class:`array`.
+            inputs (list or dict, optional): These inputs will be captured during
+              the function compilation along with the inputs to ``fun``. The ``inputs``
+              can be a :obj:`list` or a :obj:`dict` containing arbitrarily nested
+              lists, dictionaries, or arrays. Leaf nodes that are not
+              :obj:`array` are ignored. Default: ``None``
+            outputs (list or dict, optional): These outputs will be captured and
+              updated in a compiled function. The ``outputs`` can be a
+              :obj:`list` or a :obj:`dict` containing arbitrarily nested lists,
+              dictionaries, or arrays. Leaf nodes that are not :obj:`array` are ignored.
+              Default: ``None``
+            sha
+Exception ignored in atexit callback <nanobind.nb_func object at 0x102e92790>:
+RuntimeError: [metal::load_device] No Metal device available. This typically occurs in headless, sandboxed, or virtualized macOS sessions where the GPU is not accessible.
+
+exec
+/bin/zsh -lc "tools/.venv/bin/python - <<'PY'
+import mlx.core as mx
+print((mx.fast.scaled_dot_product_attention.__doc__ or '')[1200:2400])
+print((mx.compile.__doc__ or '')[1200:2400])
+PY" in /Users/satan/side/experiments/ir-multivector-retrieval
+ succeeded in 0ms:
+ape ``[B, N_q, T_q, D]``.
+            k (array): Keys with shape ``[B, N_kv, T_kv, D]``.
+            v (array): Values with shape ``[B, N_kv, T_kv, D]``.
+            scale (float): Scale for queries (typically ``1.0 / sqrt(q.shape(-1)``).
+            mask (str or array, optional): The mask to apply to the
+               query-key scores. The mask can be an array or a string indicating
+               the mask type. The only supported string type is ``"causal"``. If
+               the mask is an array it can be a boolean or additive mask. The mask
+               can have at most 4 dimensions and must be broadcast-compatible with
+               the shape ``[B, N, T_q, T_kv]``. If an additive mask is given its
+               type must promote to the promoted type of ``q``, ``k``, and ``v``.
+               The ``"causal"`` mask uses lower-right alignment where the
+               last query aligns with the last key.
+            sinks (array, optional): An optional array of attention sinks.
+               Default: ``None``.
+
+        Returns:
+            array: The output array.
+
+        Example:
+
+          .. code-block:: python
+
+            B = 2
+            N_q = N_kv = 32
+            T
+peless (bool, optional): A function compiled with the ``shapeless``
+              option enabled will not be recompiled when the input shape changes. Not all
+              functions can be compiled with ``shapeless`` enabled. Attempting to compile
+              such functions with shapeless enabled will throw. Note, changing the number
+              of dimensions or type of any input will result in a recompilation even with
+              ``shapeless`` set to ``True``. Default: ``False``
+
+        Returns:
+            Callable: A compiled function which has the same input arguments
+            as ``fun`` and returns the the same output(s).
+      
+Exception ignored in atexit callback <nanobind.nb_func object at 0x103e86790>:
+RuntimeError: [metal::load_device] No Metal device available. This typically occurs in headless, sandboxed, or virtualized macOS sessions where the GPU is not accessible.
+
+exec
+/bin/zsh -lc "nl -ba tools/requirements.txt | sed -n '1,120p'" in /Users/satan/side/experiments/ir-multivector-retrieval
+ succeeded in 0ms:
+     1	# tools/requirements.txt — Python dependencies for tools/encode.py.
+     2	#
+     3	# Owner: primitives-engineer.
+     4	# Pinned ranges, not exact versions, so the encoder picks up bugfixes
+     5	# without breaking the format. Bump pins deliberately when upgrading the
+     6	# encoder model.
+     7	
+     8	pylate>=1.1,<2.0
+     9	torch>=2.2,<3.0
+    10	
+    11	# Transitive but worth pinning loosely so we don't end up on something
+    12	# pylate hasn't validated against.
+    13	transformers>=4.40,<5.0
+    14	sentence-transformers>=3.0,<4.0
+    15	
+    16	# Optional MLX path (post-hackathon plan-12). Apple Silicon only.
+    17	# tools/encode_mlx.py uses these; pylate path (encode.py) does not need them.
+    18	# Keep the upper bound conservative: mlx-lm has occasionally tightened its
+    19	# transformers pin; if a future mlx-lm requires transformers>=5, the MLX
+    20	# path moves into a separate venv rather than pulling pylate forward.
+    21	mlx>=0.18; sys_platform == "darwin" and platform_machine == "arm64"
+    22	mlx-lm>=0.20; sys_platform == "darwin" and platform_machine == "arm64"
+
+exec
+/bin/zsh -lc "nl -ba tools/export_colbert_to_mlx.py | sed -n '260,340p'" in /Users/satan/side/experiments/ir-multivector-retrieval
+ succeeded in 0ms:
+   260	        if k not in out_weights:
+   261	            raise SystemExit(f"missing required weight {k!r}")
+   262	
+   263	    # Write outputs.
+   264	    out_dir = args.out_dir or (
+   265	        Path(__file__).resolve().parent / ".cache" / _safe_name(args.model)
+   266	    )
+   267	    out_dir.mkdir(parents=True, exist_ok=True)
+   268	
+   269	    safetensors_path = out_dir / "mlx_weights.safetensors"
+   270	    config_path = out_dir / "config.json"
+   271	
+   272	    mx.save_safetensors(str(safetensors_path), out_weights)
+   273	
+   274	    config = {
+   275	        "format_version": 1,
+   276	        "model_name": args.model,
+   277	        "architecture": "bert-base",
+   278	        "n_layers": int(n_layers),
+   279	        "hidden_size": int(hidden),
+   280	        "n_heads": int(n_heads),
+   281	        "intermediate_size": int(intermediate),
+   282	        "vocab_size": int(vocab_size),
+   283	        "max_position_embeddings": int(max_pos),
+   284	        "type_vocab_size": int(type_vocab),
+   285	        "layer_norm_eps": float(ln_eps),
+   286	        "hidden_act": hidden_act,
+   287	        "projection_in": int(proj_in),
+   288	        "projection_out": int(proj_out),
+   289	        "projection_has_bias": bool(proj_has_bias),
+   290	        "weight_dtype": args.dtype,
+   291	        "n_weights": len(out_weights),
+   292	        "discarded_keys": discarded,
+   293	    }
+   294	    with config_path.open("w", encoding="utf-8") as f:
+   295	        json.dump(config, f, indent=2, ensure_ascii=False)
+   296	        f.write("\n")
+   297	
+   298	    total_bytes = safetensors_path.stat().st_size
+   299	    print(
+   300	        f"wrote {safetensors_path} "
+   301	        f"({len(out_weights)} tensors, {total_bytes / 1024 / 1024:.1f} MB, "
+   302	        f"{args.dtype})",
+   303	        file=sys.stderr,
+   304	    )
+   305	    print(f"wrote {config_path}", file=sys.stderr)
+   306	    if discarded:
+   307	        print(
+   308	            f"discarded {len(discarded)} key(s) (pooler etc.): "
+   309	            f"{discarded[:3]}{'…' if len(discarded) > 3 else ''}",
+   310	            file=sys.stderr,
+   311	        )
+   312	
+   313	
+   314	if __name__ == "__main__":
+   315	    main()
+
+codex
+**Prioritized Recommendations**
+
+1. **Remove the PyTorch ColBERT load from the MLX path**  
+   Evidence: [tools/encode_mlx.py](/Users/satan/side/experiments/ir-multivector-retrieval/tools/encode_mlx.py:334) instantiates `pylate.models.ColBERT(...)` only for `tokenize` + `skiplist`, then separately loads MLX weights at [line 354](/Users/satan/side/experiments/ir-multivector-retrieval/tools/encode_mlx.py:354).  
+   Change: export tokenizer/skiplist metadata into `config.json`, then load a tokenizer-only path instead of the full PyTorch model. Keep pylate parity as the acceptance test.  
+   Impact: optimistic 25-40% on 100-doc CLI wall; realistic 10-25%. Large Jira workload likely <5%.  
+   Effort: M/L.  
+   Rationale: this directly attacks the fixed cost explaining why 100 docs only shows 1.44x.
+
+2. **Use MLX fused scaled-dot-product attention**  
+   Evidence: [tools/encode_mlx.py](/Users/satan/side/experiments/ir-multivector-retrieval/tools/encode_mlx.py:120) manually does `q @ k.T`, bias add, `mx.softmax`, then `attn @ v`. MLX exposes `mx.fast.scaled_dot_product_attention`.  
+   Change shape:
+   ```python
+   ctx = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=attn_bias)
+   ```
+   then keep the existing transpose/reshape/output projection.  
+   Impact: optimistic 10-25% on long batches; realistic 5-12%. Small fixture 1-5%.  
+   Effort: S.  
+   Rationale: this is the most obvious Apple Silicon hot-path miss and should reduce attention kernel count and memory traffic.
+
+3. **Stop runtime recasting all weights on every run**  
+   Evidence: [tools/export_colbert_to_mlx.py](/Users/satan/side/experiments/ir-multivector-retrieval/tools/export_colbert_to_mlx.py:85) already supports fp16 export, but [tools/encode_mlx.py](/Users/satan/side/experiments/ir-multivector-retrieval/tools/encode_mlx.py:357) always `astype`s every tensor to runtime dtype.  
+   Change: write dtype-specific files, e.g. `mlx_weights.fp16.safetensors`, and skip casting when `cfg["weight_dtype"] == dtype`.  
+   Impact: optimistic 5-15% on 100-doc CLI wall; realistic 3-8%. Jira <3%.  
+   Effort: S/M.  
+   Rationale: avoid allocating and converting the whole BERT weight set during small jobs.
+
+4. **Raise MLX batch defaults and add real length bucketing**  
+   Evidence: MLX default is `--batch 32` at [tools/encode_mlx.py](/Users/satan/side/experiments/ir-multivector-retrieval/tools/encode_mlx.py:68), and the parity harness hardcodes 32 at [tests/live/mlx_parity.py](/Users/satan/side/experiments/ir-multivector-retrieval/tests/live/mlx_parity.py:206). PyTorch MPS path already defaults to 256 at [tools/encode.py](/Users/satan/side/experiments/ir-multivector-retrieval/tools/encode.py:458).  
+   Change: add `--encoder-batch-size`, default MLX fp16 to 128/256, and add `--sort-by-length` with correct output-order restoration. Do not copy the current `encode.py` sorting block as-is; its comments admit order restoration is incomplete at [tools/encode.py](/Users/satan/side/experiments/ir-multivector-retrieval/tools/encode.py:389).  
+   Impact: optimistic 10-35% on heterogeneous Jira docs; realistic 5-20%.  
+   Effort: M.  
+   Rationale: BERT attention cost grows with padded sequence length, so packing similar lengths is high ROI.
+
+5. **Overlap CPU tokenization with MLX forward**  
+   Evidence: [tools/encode_mlx.py](/Users/satan/side/experiments/ir-multivector-retrieval/tools/encode_mlx.py:369) tokenizes, copies, forwards, evaluates, and post-processes each batch serially.  
+   Change: producer thread/process prepares `features` for batch N+1 while the main thread runs `mx.eval(model(...))` for batch N; preserve batch order through a bounded queue.  
+   Impact: optimistic 15-30% when tokenization is visible; realistic 5-15%.  
+   Effort: M.  
+   Rationale: tokenizer work is CPU-side and deterministic, so it is a natural overlap target.
+
+6. **Transfer only kept token vectors, and make the writer bulk-write arrays**  
+   Evidence: MLX copies the full padded `[B,T,dim]` result to host at [tools/encode_mlx.py](/Users/satan/side/experiments/ir-multivector-retrieval/tools/encode_mlx.py:398), then Python-loops kept indices at [line 417](/Users/satan/side/experiments/ir-multivector-retrieval/tools/encode_mlx.py:417). The shared writer then `struct.pack`s every float one by one at [tools/_tokens_bin.py](/Users/satan/side/experiments/ir-multivector-retrieval/tools/_tokens_bin.py:81).  
+   Change: build a vectorized keep mask, gather/flatten kept embeddings before host transfer, and add a fast writer path using contiguous little-endian `float32` buffers.  
+   Impact: optimistic 10-25% on large outputs; realistic 3-10%.  
+   Effort: M.  
+   Rationale: once MLX forward is fast, Python packing and padded host copies become a larger fraction of wall clock.
+
+7. **Compile and warm the MLX forward by shape bucket**  
+   Evidence: MLX currently calls `model(input_ids, attn, type_ids)` directly at [tools/encode_mlx.py](/Users/satan/side/experiments/ir-multivector-retrieval/tools/encode_mlx.py:387); PyTorch MPS path explicitly warms kernels at [tools/encode.py](/Users/satan/side/experiments/ir-multivector-retrieval/tools/encode.py:270).  
+   Change: wrap forward with `mx.compile`, ideally cached by `(dtype, B, T)` or with `shapeless=True` if it works for this graph; run one warm batch before timed/real batches.  
+   Impact: optimistic 5-20%; realistic 3-10%, shape-dependent.  
+   Effort: M.  
+   Rationale: MLX lazy graph construction and kernel compilation should not be paid repeatedly in the encode loop.
+
+8. **Fuse QKV projection after the lower-risk wins**  
+   Evidence: [tools/encode_mlx.py](/Users/satan/side/experiments/ir-multivector-retrieval/tools/encode_mlx.py:104) defines separate `q`, `k`, `v` linears and [line 116](/Users/satan/side/experiments/ir-multivector-retrieval/tools/encode_mlx.py:116) launches three projections per layer.  
+   Change: concatenate exported Q/K/V weights in [tools/export_colbert_to_mlx.py](/Users/satan/side/experiments/ir-multivector-retrieval/tools/export_colbert_to_mlx.py:117), use one `qkv` linear, then split the last dimension.  
+   Impact: optimistic 5-10%; realistic 2-6%.  
+   Effort: M.  
+   Rationale: fewer matmul launches and less Python/module dispatch per BERT layer.
+
+9. **Tighten drop-in parity coverage before marketing it as replacement**  
+   Evidence: `encode.py` supports `--mode queries` at [tools/encode.py](/Users/satan/side/experiments/ir-multivector-retrieval/tools/encode.py:85), but `encode_mlx.py` hardcodes docs metadata at [tools/encode_mlx.py](/Users/satan/side/experiments/ir-multivector-retrieval/tools/encode_mlx.py:479). Also, exported `layer_norm_eps` is stored at [tools/export_colbert_to_mlx.py](/Users/satan/side/experiments/ir-multivector-retrieval/tools/export_colbert_to_mlx.py:285) but MLX `LayerNorm` constructors ignore it.  
+   Change: add query-mode parity, batch-size parity matrix, long/short mixed corpus parity, and pass config EPS into every MLX `LayerNorm`.  
+   Impact: 0% speed; higher confidence.  
+   Effort: M.  
+   Rationale: current docs parity is strong, but “drop-in replacement” is broader than docs-only encoding.
+
+10. **Do not prioritize bf16 for speed**  
+   Evidence: dtype choices are only fp32/fp16 at [tools/encode_mlx.py](/Users/satan/side/experiments/ir-multivector-retrieval/tools/encode_mlx.py:63), and fp16 already has excellent parity in [tools/LIVE_ENCODER_NOTES.md](/Users/satan/side/experiments/ir-multivector-retrieval/tools/LIVE_ENCODER_NOTES.md:264).  
+   Change: optional `--dtype bf16` experiment only after the above; gate it through the same parity harness.  
+   Impact: optimistic 0-5%; realistic 0% or slower versus fp16.  
+   Effort: S.  
+   Rationale: bf16 may help numerical headroom, but fp16 is already parity-clean and likely the better bandwidth path.
+
+Recommended order: **1, 3, 2, 4, 6, 5, 7, 8, 9, 10**. Fixed-cost removal should move the 100-doc number first; fused attention and batching should move the real workload next.
+tokens used
+81 163
+**Prioritized Recommendations**
+
+1. **Remove the PyTorch ColBERT load from the MLX path**  
+   Evidence: [tools/encode_mlx.py](/Users/satan/side/experiments/ir-multivector-retrieval/tools/encode_mlx.py:334) instantiates `pylate.models.ColBERT(...)` only for `tokenize` + `skiplist`, then separately loads MLX weights at [line 354](/Users/satan/side/experiments/ir-multivector-retrieval/tools/encode_mlx.py:354).  
+   Change: export tokenizer/skiplist metadata into `config.json`, then load a tokenizer-only path instead of the full PyTorch model. Keep pylate parity as the acceptance test.  
+   Impact: optimistic 25-40% on 100-doc CLI wall; realistic 10-25%. Large Jira workload likely <5%.  
+   Effort: M/L.  
+   Rationale: this directly attacks the fixed cost explaining why 100 docs only shows 1.44x.
+
+2. **Use MLX fused scaled-dot-product attention**  
+   Evidence: [tools/encode_mlx.py](/Users/satan/side/experiments/ir-multivector-retrieval/tools/encode_mlx.py:120) manually does `q @ k.T`, bias add, `mx.softmax`, then `attn @ v`. MLX exposes `mx.fast.scaled_dot_product_attention`.  
+   Change shape:
+   ```python
+   ctx = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=attn_bias)
+   ```
+   then keep the existing transpose/reshape/output projection.  
+   Impact: optimistic 10-25% on long batches; realistic 5-12%. Small fixture 1-5%.  
+   Effort: S.  
+   Rationale: this is the most obvious Apple Silicon hot-path miss and should reduce attention kernel count and memory traffic.
+
+3. **Stop runtime recasting all weights on every run**  
+   Evidence: [tools/export_colbert_to_mlx.py](/Users/satan/side/experiments/ir-multivector-retrieval/tools/export_colbert_to_mlx.py:85) already supports fp16 export, but [tools/encode_mlx.py](/Users/satan/side/experiments/ir-multivector-retrieval/tools/encode_mlx.py:357) always `astype`s every tensor to runtime dtype.  
+   Change: write dtype-specific files, e.g. `mlx_weights.fp16.safetensors`, and skip casting when `cfg["weight_dtype"] == dtype`.  
+   Impact: optimistic 5-15% on 100-doc CLI wall; realistic 3-8%. Jira <3%.  
+   Effort: S/M.  
+   Rationale: avoid allocating and converting the whole BERT weight set during small jobs.
+
+4. **Raise MLX batch defaults and add real length bucketing**  
+   Evidence: MLX default is `--batch 32` at [tools/encode_mlx.py](/Users/satan/side/experiments/ir-multivector-retrieval/tools/encode_mlx.py:68), and the parity harness hardcodes 32 at [tests/live/mlx_parity.py](/Users/satan/side/experiments/ir-multivector-retrieval/tests/live/mlx_parity.py:206). PyTorch MPS path already defaults to 256 at [tools/encode.py](/Users/satan/side/experiments/ir-multivector-retrieval/tools/encode.py:458).  
+   Change: add `--encoder-batch-size`, default MLX fp16 to 128/256, and add `--sort-by-length` with correct output-order restoration. Do not copy the current `encode.py` sorting block as-is; its comments admit order restoration is incomplete at [tools/encode.py](/Users/satan/side/experiments/ir-multivector-retrieval/tools/encode.py:389).  
+   Impact: optimistic 10-35% on heterogeneous Jira docs; realistic 5-20%.  
+   Effort: M.  
+   Rationale: BERT attention cost grows with padded sequence length, so packing similar lengths is high ROI.
+
+5. **Overlap CPU tokenization with MLX forward**  
+   Evidence: [tools/encode_mlx.py](/Users/satan/side/experiments/ir-multivector-retrieval/tools/encode_mlx.py:369) tokenizes, copies, forwards, evaluates, and post-processes each batch serially.  
+   Change: producer thread/process prepares `features` for batch N+1 while the main thread runs `mx.eval(model(...))` for batch N; preserve batch order through a bounded queue.  
+   Impact: optimistic 15-30% when tokenization is visible; realistic 5-15%.  
+   Effort: M.  
+   Rationale: tokenizer work is CPU-side and deterministic, so it is a natural overlap target.
+
+6. **Transfer only kept token vectors, and make the writer bulk-write arrays**  
+   Evidence: MLX copies the full padded `[B,T,dim]` result to host at [tools/encode_mlx.py](/Users/satan/side/experiments/ir-multivector-retrieval/tools/encode_mlx.py:398), then Python-loops kept indices at [line 417](/Users/satan/side/experiments/ir-multivector-retrieval/tools/encode_mlx.py:417). The shared writer then `struct.pack`s every float one by one at [tools/_tokens_bin.py](/Users/satan/side/experiments/ir-multivector-retrieval/tools/_tokens_bin.py:81).  
+   Change: build a vectorized keep mask, gather/flatten kept embeddings before host transfer, and add a fast writer path using contiguous little-endian `float32` buffers.  
+   Impact: optimistic 10-25% on large outputs; realistic 3-10%.  
+   Effort: M.  
+   Rationale: once MLX forward is fast, Python packing and padded host copies become a larger fraction of wall clock.
+
+7. **Compile and warm the MLX forward by shape bucket**  
+   Evidence: MLX currently calls `model(input_ids, attn, type_ids)` directly at [tools/encode_mlx.py](/Users/satan/side/experiments/ir-multivector-retrieval/tools/encode_mlx.py:387); PyTorch MPS path explicitly warms kernels at [tools/encode.py](/Users/satan/side/experiments/ir-multivector-retrieval/tools/encode.py:270).  
+   Change: wrap forward with `mx.compile`, ideally cached by `(dtype, B, T)` or with `shapeless=True` if it works for this graph; run one warm batch before timed/real batches.  
+   Impact: optimistic 5-20%; realistic 3-10%, shape-dependent.  
+   Effort: M.  
+   Rationale: MLX lazy graph construction and kernel compilation should not be paid repeatedly in the encode loop.
+
+8. **Fuse QKV projection after the lower-risk wins**  
+   Evidence: [tools/encode_mlx.py](/Users/satan/side/experiments/ir-multivector-retrieval/tools/encode_mlx.py:104) defines separate `q`, `k`, `v` linears and [line 116](/Users/satan/side/experiments/ir-multivector-retrieval/tools/encode_mlx.py:116) launches three projections per layer.  
+   Change: concatenate exported Q/K/V weights in [tools/export_colbert_to_mlx.py](/Users/satan/side/experiments/ir-multivector-retrieval/tools/export_colbert_to_mlx.py:117), use one `qkv` linear, then split the last dimension.  
+   Impact: optimistic 5-10%; realistic 2-6%.  
+   Effort: M.  
+   Rationale: fewer matmul launches and less Python/module dispatch per BERT layer.
+
+9. **Tighten drop-in parity coverage before marketing it as replacement**  
+   Evidence: `encode.py` supports `--mode queries` at [tools/encode.py](/Users/satan/side/experiments/ir-multivector-retrieval/tools/encode.py:85), but `encode_mlx.py` hardcodes docs metadata at [tools/encode_mlx.py](/Users/satan/side/experiments/ir-multivector-retrieval/tools/encode_mlx.py:479). Also, exported `layer_norm_eps` is stored at [tools/export_colbert_to_mlx.py](/Users/satan/side/experiments/ir-multivector-retrieval/tools/export_colbert_to_mlx.py:285) but MLX `LayerNorm` constructors ignore it.  
+   Change: add query-mode parity, batch-size parity matrix, long/short mixed corpus parity, and pass config EPS into every MLX `LayerNorm`.  
+   Impact: 0% speed; higher confidence.  
+   Effort: M.  
+   Rationale: current docs parity is strong, but “drop-in replacement” is broader than docs-only encoding.
+
+10. **Do not prioritize bf16 for speed**  
+   Evidence: dtype choices are only fp32/fp16 at [tools/encode_mlx.py](/Users/satan/side/experiments/ir-multivector-retrieval/tools/encode_mlx.py:63), and fp16 already has excellent parity in [tools/LIVE_ENCODER_NOTES.md](/Users/satan/side/experiments/ir-multivector-retrieval/tools/LIVE_ENCODER_NOTES.md:264).  
+   Change: optional `--dtype bf16` experiment only after the above; gate it through the same parity harness.  
+   Impact: optimistic 0-5%; realistic 0% or slower versus fp16.  
+   Effort: S.  
+   Rationale: bf16 may help numerical headroom, but fp16 is already parity-clean and likely the better bandwidth path.
+
+Recommended order: **1, 3, 2, 4, 6, 5, 7, 8, 9, 10**. Fixed-cost removal should move the 100-doc number first; fused attention and batching should move the real workload next.
