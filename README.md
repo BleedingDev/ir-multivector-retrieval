@@ -18,21 +18,48 @@ Clustering target: 600M token vectors → 262K centroids in ~8 minutes on a 64-t
 
 ## Measured performance (Apple Silicon, 10 cores)
 
-Initial benchmark on a 2,000-doc Jira corpus (Czech), `jinaai/jina-colbert-v2-64`, dim=64, 117,645 token vectors, kappa=10240:
+Two corpora on a real Czech Jira ticket archive, `jinaai/jina-colbert-v2-64`, dim=64.
+
+### 2,000-doc chunk (117,645 token vectors, kappa=10,240, θ=10 paper-relax)
 
 | Build phase       | 1 thread | 10 threads | Speedup |
 |-------------------|---------:|-----------:|--------:|
 | `tac.clusterFlat` |    218 ms |     164 ms | 1.3× |
-| residuals + norms |      9 ms |       9 ms | —    |
+| residuals + norms |      9 ms |       4 ms | 2.4× |
 | **`pq.train`**    |  42,575 ms |  **7,605 ms** | **5.6×** |
-| `pq.encode`       |    820 ms |     827 ms | —    |
+| `pq.encode`       |    820 ms |     145 ms | 5.6× |
 | `hnsw.build`      |  3,838 ms |   3,790 ms | —    |
 | serialise         |     16 ms |      16 ms | —    |
 | **Total**         |  **47,477 ms** |  **12,413 ms** | **3.8×** |
 
-Search latency (paper-strict single-core): **~27 ms / query** at `kappa_c=80, kappa_d=1000` on the same index. Quality smoke: top hit on `"Jak nastavit DKIM a SPF pro newslettery z jiné domény?"` is `jira:ABC-1` (the matching Jira ticket), agreeing with the WARP baseline at `ir-expo/services/warp-service`.
+### Full 26,678-doc corpus (1,521,797 token vectors, kappa=32,768, paper-strict μ/τ/ε/θ)
 
-PQ training was the dominant bottleneck (90% of single-thread build); the M=32 subspaces are independent so static-chunk parallelism scales nearly linearly to ~32 threads. HNSW build is the next target — currently single-threaded.
+19,221 distinct token IDs < 39,020 paper-strict max → no relaxation needed.
+
+| Phase | Time | Notes |
+|---|---:|---|
+| Metal encode (pylate, fp32, batch=64) | **48 min** | GPU-bound; FP16 + larger batch is 4-6× ahead |
+| `tac.clusterFlat` (parallel) | 5.7 s | |
+| residuals + norms (parallel) | 24 ms | |
+| **`pq.train` (parallel)** | **110.4 s** | 82% of build; within-subspace parallelism still ahead |
+| `pq.encode` (parallel) | 1.6 s | |
+| `hnsw.build` (serial today) | 17.0 s | next parallelism target |
+| serialise | 0.15 s | |
+| **Build total (10 threads)** | **2 min 15 s** | 615% CPU |
+| **Search latency** | **~54 ms / query** | paper-strict single-core, `kappa_c=80, kappa_d=1000` |
+| **Index size** | **75.8 MB** | for 26,678 Jira tickets |
+
+Quality smoke on Czech queries:
+- `"rozesílání hromadné pošty z eshop domény"` → top hit `jira:ABC-1` (DKIM/SPF newsletter ticket) — matches WARP / `setup-note.md` ground truth.
+- 0 docs dropped during encode — pylate's ColBERTv2 path handles all 26k Jira tickets including Czech multilingual content cleanly.
+
+### Optimization story
+
+Build was 47.5 s single-thread on the 2 k chunk; we got it to 12.4 s by parallelising the four embarrassingly-parallel stages (TAC per-token, PQ train per-subspace, PQ encode per-token, residuals per-token). PQ training stayed dominant because M=32 subspaces / 10 threads is the cap. The next levers in order of payoff:
+
+1. **HNSW parallel insertion** — per-layer batched with per-node locks (~3 s saving at 2 k scale, ~10 s at 26 k).
+2. **Within-subspace k-means parallelism** — split each subspace's 117k–1.5M vectors across cores (could 2-3× pq.train on top of subspace parallelism).
+3. **FP16 Metal inference + bigger batches in the encoder** — 4-6× on the 48-minute encode; the single biggest absolute win since encode is 95 % of total ingestion cost.
 
 ## Why Zig
 
