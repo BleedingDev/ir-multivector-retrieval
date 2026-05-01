@@ -125,7 +125,7 @@ class BertSelfAttention(nn.Module):
     weight layout exactly. q/k/v are separate Linear layers (HF stores
     them split, not as a fused QKV)."""
 
-    def __init__(self, hidden: int, n_heads: int):
+    def __init__(self, hidden: int, n_heads: int, layer_norm_eps: float):
         super().__init__()
         if hidden % n_heads != 0:
             raise SystemExit(f"hidden {hidden} not divisible by n_heads {n_heads}")
@@ -135,7 +135,7 @@ class BertSelfAttention(nn.Module):
         self.k = nn.Linear(hidden, hidden)
         self.v = nn.Linear(hidden, hidden)
         self.out = nn.Linear(hidden, hidden)
-        self.ln = nn.LayerNorm(hidden)
+        self.ln = nn.LayerNorm(hidden, eps=layer_norm_eps)
 
     def __call__(self, x: mx.array, attn_bias: mx.array) -> mx.array:
         B, T, H = x.shape
@@ -162,11 +162,11 @@ class BertSelfAttention(nn.Module):
 class BertFFN(nn.Module):
     """Position-wise FFN: up-project (gelu) → down-project → residual + LN."""
 
-    def __init__(self, hidden: int, intermediate: int):
+    def __init__(self, hidden: int, intermediate: int, layer_norm_eps: float):
         super().__init__()
         self.up = nn.Linear(hidden, intermediate)
         self.down = nn.Linear(intermediate, hidden)
-        self.ln = nn.LayerNorm(hidden)
+        self.ln = nn.LayerNorm(hidden, eps=layer_norm_eps)
 
     def __call__(self, x: mx.array) -> mx.array:
         h = self.up(x)
@@ -176,10 +176,10 @@ class BertFFN(nn.Module):
 
 
 class BertLayer(nn.Module):
-    def __init__(self, hidden: int, n_heads: int, intermediate: int):
+    def __init__(self, hidden: int, n_heads: int, intermediate: int, layer_norm_eps: float):
         super().__init__()
-        self.attn = BertSelfAttention(hidden, n_heads)
-        self.ff = BertFFN(hidden, intermediate)
+        self.attn = BertSelfAttention(hidden, n_heads, layer_norm_eps)
+        self.ff = BertFFN(hidden, intermediate, layer_norm_eps)
 
     def __call__(self, x: mx.array, attn_bias: mx.array) -> mx.array:
         x = self.attn(x, attn_bias)
@@ -188,12 +188,12 @@ class BertLayer(nn.Module):
 
 
 class BertEmbeddings(nn.Module):
-    def __init__(self, vocab: int, max_pos: int, type_vocab: int, hidden: int):
+    def __init__(self, vocab: int, max_pos: int, type_vocab: int, hidden: int, layer_norm_eps: float):
         super().__init__()
         self.word = nn.Embedding(vocab, hidden)
         self.position = nn.Embedding(max_pos, hidden)
         self.token_type = nn.Embedding(type_vocab, hidden)
-        self.ln = nn.LayerNorm(hidden)
+        self.ln = nn.LayerNorm(hidden, eps=layer_norm_eps)
 
     def __call__(self, input_ids: mx.array, token_type_ids: mx.array) -> mx.array:
         T = input_ids.shape[1]
@@ -210,17 +210,24 @@ class ColBertMLX(nn.Module):
     def __init__(self, cfg: dict):
         super().__init__()
         self.cfg = cfg
+        # HF BERT defaults to 1e-12; older sentence-transformers/jina configs
+        # ship 1e-7. Either way, omitting it (mlx default 1e-5) shifts LN
+        # outputs by ~1e-5 on tail tokens with small variance. Thread the
+        # exporter-recorded value into every LayerNorm.
+        layer_norm_eps = float(cfg.get("layer_norm_eps", 1e-12))
         self.embeddings = BertEmbeddings(
             vocab=cfg["vocab_size"],
             max_pos=cfg["max_position_embeddings"],
             type_vocab=cfg["type_vocab_size"],
             hidden=cfg["hidden_size"],
+            layer_norm_eps=layer_norm_eps,
         )
         self.layers = [
             BertLayer(
                 hidden=cfg["hidden_size"],
                 n_heads=cfg["n_heads"],
                 intermediate=cfg["intermediate_size"],
+                layer_norm_eps=layer_norm_eps,
             )
             for _ in range(cfg["n_layers"])
         ]
