@@ -286,35 +286,75 @@ fires when pylate expands the BERT vocab to add ColBERT's `[D]` and
 forward pass. That drift is below the parity floor so it doesn't break
 gate 2, but it does mean MLX is now the more reproducible backend.
 
-### Measured speedup
+### Measured speedup (post-plan-13)
 
-End-to-end CLI wall-clock, back-to-back so HF cache + MLX kernels are warm:
+End-to-end CLI wall-clock, back-to-back so HF cache + MLX kernels are warm.
+Re-measured after plan-13 perf tuning (fused SDPA, dtype-specific weights,
+larger batch defaults + opt-in --sort-by-length, vectorized keep gather +
+bulk-write writer).
 
 100-doc live fixture (1592 kept tokens, mostly short synthetic English):
 
-| invocation                                | wall   | speedup |
-|-------------------------------------------|--------|---------|
-| encode.py fp32 cpu, batch=32              | 11.48s | 1.00×   |
-| encode_mlx.py fp32, batch=32              | 10.08s | 1.14×   |
-| encode_mlx.py fp16, batch=32              |  7.97s | **1.44×** |
+| invocation                                                 | wall   | speedup |
+|------------------------------------------------------------|--------|---------|
+| encode.py fp32 cpu, batch=32                               |  4.10s | 1.00×   |
+| encode_mlx.py fp16, batch=128 (default, post-plan-13)      |  3.86s | 1.06×   |
 
 1000-doc Jira subset (55202 kept tokens, avg ~2.7 kB per doc):
 
-| invocation                                | wall   | speedup |
-|-------------------------------------------|--------|---------|
-| encode.py fp32 cpu, batch=32              | 67.72s | 1.00×   |
-| encode_mlx.py fp32, batch=32              | 19.52s | **3.47×** |
-| encode_mlx.py fp16, batch=32              | 16.18s | **4.19×** |
+| invocation                                                 | wall   | speedup |
+|------------------------------------------------------------|--------|---------|
+| encode.py fp32 cpu, batch=32                               | 35.6s  | 1.00×   |
+| encode_mlx.py fp16, batch=32 (parity-harness config)       | 10.4s  | 3.4×    |
+| encode_mlx.py fp16, batch=128 (default, post-plan-13)      | 10.1s  | 3.5×    |
+| encode_mlx.py fp16, batch=128 + --sort-by-length           |  5.7s  | **6.2×** |
+
+Apple Silicon thermals are noisy across back-to-back runs (a sustained
+encode loop heats the SoC and back-to-back wall-clocks drift up by 30-50%
+once the system throttles). The numbers above are the median of three
+runs after a cooldown gap; numerically equivalent runs on a previously
+hot SoC come out ~30-50% slower.
 
 The 100-doc fixture is too small to amortize tokenizer + cold-start cost
-(fixed overhead dominates wall). The 1000-doc Jira subset is closer to
-real workloads and shows MLX's actual lever: ~3.5× at fp32, ~4.2× at fp16
-over PyTorch's cpu fp32 path. Note we're NOT comparing against PyTorch
-MPS fp16 — that path's separate measurements live in the
-`### Measured speedup (Apple Silicon, jina-colbert-v2-64)` table above
-(fp16 MPS at 9.6s on 100-doc, 90.18s on 1000-doc Jira; against those
-numbers MLX is roughly comparable on tiny fixtures and ~5–6× on the Jira
-subset).
+(fixed overhead dominates wall — encode.py and encode_mlx.py converge
+near 4s once the pylate model load + HF cache warm dominates). The
+1000-doc Jira subset is closer to real workloads and shows MLX's actual
+lever, especially with --sort-by-length where per-batch padding waste
+collapses on the heterogeneous Jira length distribution.
+
+#### Per-rec impact (plan-13)
+
+Order applied: rec-03 (fused SDPA) → rec-02 (dtype-specific weights) →
+rec-04 (batch + sort) → rec-05 (vectorized gather + bulk writer). Numbers
+are on the 1000-doc Jira subset, fp16, batch=32 unless noted, measured
+when the SoC was cool:
+
+| rec | what changed                                | 1000-doc fp16 wall | delta vs prev |
+|-----|---------------------------------------------|-------------------:|---------------|
+| baseline (post-plan-12)                          | ~8.80s     | —             |
+| rec-03 fused SDPA                                | ~7.84s     | ~11%          |
+| rec-02 skip startup astype (dtype-specific weights) | ~8.4s   | noise band    |
+| rec-04 batch=128 default                          | ~7.24s    | ~8%           |
+| rec-04 + --sort-by-length                         | ~5.65s    | ~28% on top of rec-04 default |
+| rec-05 vectorized gather + bulk writer            | within noise of rec-04 | <5% |
+
+Honest takeaways:
+
+* **Fused SDPA is the cleanest win** — single kernel call replaces a
+  4-step manual attention, ~10% on the 1000-doc workload at zero risk.
+* **Sort-by-length is the largest lever** when the corpus has length
+  variance (Jira docs span 2-5× in token count). The benefit shrinks
+  toward zero on uniform-length corpora.
+* **Dtype-specific weights and bulk-write writer** are real but small on
+  warm benches — they remove startup astype and per-float struct.pack
+  hot paths that show up more on cold runs / large outputs respectively.
+  Microbench: bulk writer is 30× faster on the write step alone (0.36s
+  → 0.012s on 1000 × 55 × 128), but the write step is a small fraction
+  of total wall.
+* Compounded wins are NOT additive. Sort-by-length + fused SDPA share
+  the same Amdahl envelope (both reduce attention compute). The
+  realistic combined ceiling on this hardware is the ~6× we see at fp16
+  with sort.
 
 ### Recommendation
 
