@@ -1,0 +1,101 @@
+
+=== 100doc/encode.py/fp32/cpu/batch=32 ===
+cmd: /Users/satan/side/experiments/ir-multivector-retrieval/tools/.venv/bin/python /Users/satan/side/experiments/ir-multivector-retrieval/tools/encode.py --docs /Users/satan/side/experiments/ir-multivector-retrieval/tests/fixtures/live/docs.jsonl --out /Users/satan/side/experiments/ir-multivector-retrieval/.codex/bench-outputs/100doc_pt_fp32.bin --device cpu --dtype fp32 --batch 32
+warmups (discarded): 3
+  warmup[0]: 11.03s
+
+=== 100doc/encode.py/fp32/cpu/batch=32 ===
+warmups (discarded): 2
+  warmup[0]: 9.80s
+  warmup[1]: 7.49s
+measured: 3
+  measured[0]: 7.04s
+  measured[1]: 6.83s
+  measured[2]: 6.83s
+  median=6.83s min=6.83s max=7.04s
+
+appended 1 cell(s) to /Users/satan/side/experiments/ir-multivector-retrieval/.codex/bench-outputs/rebench_results.jsonl
+
+=== 100doc/encode_mlx/fp16/batch=128 ===
+warmups (discarded): 2
+  warmup[0]: 7.29s
+  warmup[1]: 6.44s
+measured: 3
+  measured[0]: 6.84s
+  measured[1]: 6.55s
+  measured[2]: 6.47s
+  median=6.55s min=6.47s max=6.84s
+
+appended 1 cell(s) to /Users/satan/side/experiments/ir-multivector-retrieval/.codex/bench-outputs/rebench_results.jsonl
+
+=== 100doc/encode_mlx/fp32/batch=128 ===
+warmups (discarded): 2
+  warmup[0]: 6.70s
+  warmup[1]: 6.55s
+measured: 3
+  measured[0]: 7.05s
+  measured[1]: 7.31s
+  measured[2]: 6.60s
+  median=7.05s min=6.60s max=7.31s
+
+appended 1 cell(s) to /Users/satan/side/experiments/ir-multivector-retrieval/.codex/bench-outputs/rebench_results.jsonl
+
+=== 1000doc/encode.py/fp32/cpu/batch=32 ===
+warmups (discarded): 2
+  warmup[0]: 75.02s
+  warmup[1]: 77.65s
+measured: 3
+  measured[0]: 84.36s
+  measured[1]: 118.86s
+  measured[2]: 93.17s
+  median=93.17s min=84.36s max=118.86s
+
+appended 1 cell(s) to /Users/satan/side/experiments/ir-multivector-retrieval/.codex/bench-outputs/rebench_results.jsonl
+
+=== 1000doc/encode_mlx/fp16/batch=32 ===
+warmups (discarded): 2
+  warmup[0]: 18.31s
+  warmup[1]: 20.09s
+measured: 3
+  measured[0]: 19.96s
+  measured[1]: 19.20s
+  measured[2]: 18.04s
+  median=19.20s min=18.04s max=19.96s
+
+appended 1 cell(s) to /Users/satan/side/experiments/ir-multivector-retrieval/.codex/bench-outputs/rebench_results.jsonl
+
+=== 1000doc/encode_mlx/fp16/batch=128 ===
+warmups (discarded): 2
+  warmup[0]: 17.75s
+  warmup[1]: 19.47s
+measured: 3
+  measured[0]: 15.99s
+  measured[1]: 19.31s
+  measured[2]: 17.11s
+  median=17.11s min=15.99s max=19.31s
+
+appended 1 cell(s) to /Users/satan/side/experiments/ir-multivector-retrieval/.codex/bench-outputs/rebench_results.jsonl
+
+=== 1000doc/encode_mlx/fp16/batch=128/sort ===
+warmups (discarded): 2
+  warmup[0]: 13.08s
+  warmup[1]: 19.41s
+measured: 3
+  measured[0]: 15.05s
+  measured[1]: 14.72s
+  measured[2]: 12.64s
+  median=14.72s min=12.64s max=15.05s
+
+appended 1 cell(s) to /Users/satan/side/experiments/ir-multivector-retrieval/.codex/bench-outputs/rebench_results.jsonl
+
+=== 1000doc/encode_mlx/fp32/batch=128/sort ===
+warmups (discarded): 2
+  warmup[0]: 14.39s
+  warmup[1]: 16.45s
+measured: 3
+  measured[0]: 13.28s
+  measured[1]: 14.86s
+  measured[2]: 15.49s
+  median=14.86s min=13.28s max=15.49s
+
+appended 1 cell(s) to /Users/satan/side/experiments/ir-multivector-retrieval/.codex/bench-outputs/rebench_results.jsonl
