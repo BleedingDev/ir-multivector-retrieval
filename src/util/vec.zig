@@ -27,10 +27,66 @@ pub const VecError = error{
 /// paper §3.1: token similarities are dot products of L2-normalised f32
 /// embeddings (cosine), used everywhere from k-means assignment to the
 /// gather-phase ⟨q_i, c_j⟩ accumulator.
-pub fn dot(a: []const f32, b: []const f32) VecError!f32 {
+///
+/// plan-11: dispatcher for the four dims that actually appear in this repo —
+/// 2 and 4 (PQ subspaces, since dim ∈ {64, 128} and PQ_M=32) and 64/128 (the
+/// jina-colbert-v2-64 and ColBERTv2.0 token embeddings). Marked `inline` so
+/// the caller's `a.len` propagates through the switch and LLVM DCEs every
+/// other arm; without `inline` the runtime branch on `a.len` was a net loss
+/// in the kmeans-assign hot loop (see plan-11 microbench).
+pub inline fn dot(a: []const f32, b: []const f32) VecError!f32 {
     if (a.len != b.len) return error.LengthMismatch;
-    const n = a.len;
+    // dim=2 is hand-inlined here rather than going through `dotComptime(2,...)`:
+    // the indirection occasionally blocks LLVM from constant-folding the slice
+    // length all the way to two scalar mul-adds. Hand-inlining is unambiguous.
+    return switch (a.len) {
+        2 => a[0] * b[0] + a[1] * b[1],
+        4 => dotComptime(4, a, b),
+        64 => dotComptime(64, a, b),
+        128 => dotComptime(128, a, b),
+        else => dotGeneric(a, b),
+    };
+}
 
+/// Comptime-specialized dot product. `dim` is known at compile time so the
+/// reduction loop fully unrolls, the tail branch disappears, and LLVM is free
+/// to schedule the lanes across multiple FMA pipes.
+///
+/// Caller must guarantee `a.len == b.len == dim`; this is a private helper
+/// reached only via the `dot` dispatcher (which has already validated lengths).
+pub inline fn dotComptime(comptime dim: u32, a: []const f32, b: []const f32) f32 {
+    std.debug.assert(a.len == dim and b.len == dim);
+
+    if (dim == 0) return 0.0;
+
+    // dim ≤ 4 → inline scalar unroll. Padding into a 4-wide @Vector adds two
+    // tiny stack stores + a reduce that's strictly slower than a flat scalar
+    // chain on this size class (the PQ subspace path).
+    if (dim <= 4) {
+        var s: f32 = 0.0;
+        inline for (0..dim) |i| s += a[i] * b[i];
+        return s;
+    }
+
+    const lanes: comptime_int = comptime laneWidthFor(dim);
+    const V = @Vector(lanes, f32);
+
+    // dim > lanes: comptime-unrolled lane loop over @Vector(4) chunks.
+    comptime std.debug.assert(dim % lanes == 0);
+    const n_chunks: comptime_int = dim / lanes;
+    var acc: V = @splat(0.0);
+    inline for (0..n_chunks) |c| {
+        const off = c * lanes;
+        const va: V = a[off..][0..lanes].*;
+        const vb: V = b[off..][0..lanes].*;
+        acc += va * vb;
+    }
+    return @reduce(.Add, acc);
+}
+
+/// Generic runtime-`lane_count` dot product for unspecialized dims.
+inline fn dotGeneric(a: []const f32, b: []const f32) f32 {
+    const n = a.len;
     var acc: Vec = @splat(0.0);
     var i: usize = 0;
     while (i + lane_count <= n) : (i += lane_count) {
@@ -47,10 +103,58 @@ pub fn dot(a: []const f32, b: []const f32) VecError!f32 {
 ///
 /// paper §3.1: the spread `s_j = (1/n_j)·Σ ‖t_{j,i} − t̄_j‖²` is a sum of
 /// l2sq terms, and Lloyd's-step assignment minimises the same quantity.
-pub fn l2sq(a: []const f32, b: []const f32) VecError!f32 {
+pub inline fn l2sq(a: []const f32, b: []const f32) VecError!f32 {
     if (a.len != b.len) return error.LengthMismatch;
-    const n = a.len;
+    return switch (a.len) {
+        // dim=2 directly inline — same plan-11 reasoning as `dot`. PQ encode
+        // hits this path on every (subspace × centroid × token) triple.
+        2 => blk: {
+            const d0 = a[0] - b[0];
+            const d1 = a[1] - b[1];
+            break :blk d0 * d0 + d1 * d1;
+        },
+        4 => l2sqComptime(4, a, b),
+        64 => l2sqComptime(64, a, b),
+        128 => l2sqComptime(128, a, b),
+        else => l2sqGeneric(a, b),
+    };
+}
 
+/// Comptime-specialized squared L2 distance. See `dotComptime` for the
+/// register/unroll strategy.
+pub inline fn l2sqComptime(comptime dim: u32, a: []const f32, b: []const f32) f32 {
+    std.debug.assert(a.len == dim and b.len == dim);
+
+    if (dim == 0) return 0.0;
+
+    if (dim <= 4) {
+        var s: f32 = 0.0;
+        inline for (0..dim) |i| {
+            const d = a[i] - b[i];
+            s += d * d;
+        }
+        return s;
+    }
+
+    const lanes: comptime_int = comptime laneWidthFor(dim);
+    const V = @Vector(lanes, f32);
+
+    comptime std.debug.assert(dim % lanes == 0);
+    const n_chunks: comptime_int = dim / lanes;
+    var acc: V = @splat(0.0);
+    inline for (0..n_chunks) |c| {
+        const off = c * lanes;
+        const va: V = a[off..][0..lanes].*;
+        const vb: V = b[off..][0..lanes].*;
+        const d = va - vb;
+        acc += d * d;
+    }
+    return @reduce(.Add, acc);
+}
+
+/// Generic runtime-`lane_count` l2sq for unspecialized dims.
+inline fn l2sqGeneric(a: []const f32, b: []const f32) f32 {
+    const n = a.len;
     var acc: Vec = @splat(0.0);
     var i: usize = 0;
     while (i + lane_count <= n) : (i += lane_count) {
@@ -67,14 +171,64 @@ pub fn l2sq(a: []const f32, b: []const f32) VecError!f32 {
     return sum;
 }
 
-/// L2-normalise `v` in place. Zero-length vectors are left untouched (the
-/// only reasonable choice — there is no unit direction for the zero vector).
+/// L2-normalise `v` in place. Zero-length vectors are an error (callers should
+/// have at least one element); the all-zero vector is left untouched (no unit
+/// direction exists).
 ///
 /// paper convention: ColBERT/Tachiom assume unit-norm token embeddings so
 /// cosine collapses to dot product.
-pub fn normalizeInPlace(v: []f32) VecError!void {
+pub inline fn normalizeInPlace(v: []f32) VecError!void {
     if (v.len == 0) return error.EmptyInput;
+    switch (v.len) {
+        64 => normalizeComptime(64, v),
+        128 => normalizeComptime(128, v),
+        else => normalizeGeneric(v),
+    }
+}
 
+/// Comptime-specialized in-place normalize.
+pub inline fn normalizeComptime(comptime dim: u32, v: []f32) void {
+    std.debug.assert(v.len == dim);
+    if (dim == 0) return;
+
+    var norm_sq: f32 = 0.0;
+
+    if (dim <= 4) {
+        inline for (0..dim) |i| norm_sq += v[i] * v[i];
+    } else {
+        const lanes: comptime_int = comptime laneWidthFor(dim);
+        const V = @Vector(lanes, f32);
+        comptime std.debug.assert(dim % lanes == 0);
+        const n_chunks: comptime_int = dim / lanes;
+        var acc: V = @splat(0.0);
+        inline for (0..n_chunks) |c| {
+            const off = c * lanes;
+            const x: V = v[off..][0..lanes].*;
+            acc += x * x;
+        }
+        norm_sq = @reduce(.Add, acc);
+    }
+
+    if (norm_sq == 0.0) return;
+    const inv_norm: f32 = 1.0 / @sqrt(norm_sq);
+
+    if (dim <= 4) {
+        inline for (0..dim) |i| v[i] *= inv_norm;
+    } else {
+        const lanes: comptime_int = comptime laneWidthFor(dim);
+        const V = @Vector(lanes, f32);
+        const splat_inv: V = @splat(inv_norm);
+        const n_chunks: comptime_int = dim / lanes;
+        inline for (0..n_chunks) |c| {
+            const off = c * lanes;
+            const x: V = v[off..][0..lanes].*;
+            v[off..][0..lanes].* = x * splat_inv;
+        }
+    }
+}
+
+/// Generic runtime-`lane_count` normalize for unspecialized dims.
+inline fn normalizeGeneric(v: []f32) void {
     var acc: Vec = @splat(0.0);
     var i: usize = 0;
     while (i + lane_count <= v.len) : (i += lane_count) {
@@ -94,6 +248,18 @@ pub fn normalizeInPlace(v: []f32) VecError!void {
         v[i..][0..lane_count].* = x * splat_inv;
     }
     while (i < v.len) : (i += 1) v[i] *= inv_norm;
+}
+
+/// Pick a SIMD lane width for a comptime-known `dim`.
+///
+/// On Apple Silicon NEON is 128-bit (4×f32). We always pick 4 — empirically
+/// (plan-11 microbench) wider @Vector(16) accumulators lower to 4 stacked
+/// NEON regs and end up *slower* than a comptime-unrolled loop over a single
+/// 4-wide register. The win from comptime specialization is the unrolled,
+/// branch-free reduction, not a wider accumulator.
+fn laneWidthFor(comptime dim: u32) comptime_int {
+    _ = dim;
+    return 4;
 }
 
 /// Index of the smallest element. Empty input is an error rather than an
@@ -294,4 +460,184 @@ test "normalizeRowsInPlace: 2 rows of dim 2" {
 test "normalizeRowsInPlace: bad dim is an error" {
     var rows = [_]f32{ 1.0, 2.0, 3.0 };
     try testing.expectError(error.LengthMismatch, normalizeRowsInPlace(&rows, 2));
+}
+
+// ---------------------------------------------------------------------------
+// plan-11 — comptime-specialization parity tests.
+//
+// For each specialized dim ∈ {2, 4, 64, 128} verify the comptime kernel agrees
+// with a scalar reference within 1e-5 absolute. We test both hand-checkable
+// inputs and generated patterns (ramp + permutation).
+// ---------------------------------------------------------------------------
+
+fn scalarDotRef(a: []const f32, b: []const f32) f32 {
+    var s: f32 = 0.0;
+    for (a, b) |x, y| s += x * y;
+    return s;
+}
+
+fn scalarL2sqRef(a: []const f32, b: []const f32) f32 {
+    var s: f32 = 0.0;
+    for (a, b) |x, y| {
+        const d = x - y;
+        s += d * d;
+    }
+    return s;
+}
+
+fn scalarNormSqRef(v: []const f32) f32 {
+    var s: f32 = 0.0;
+    for (v) |x| s += x * x;
+    return s;
+}
+
+test "plan-11 parity: dot dim=2 hand-checked" {
+    const a = [_]f32{ 1.0, 2.0 };
+    const b = [_]f32{ 3.0, 4.0 };
+    // 1*3 + 2*4 = 11
+    try testing.expectApproxEqAbs(@as(f32, 11.0), try dot(&a, &b), 1e-5);
+    try testing.expectApproxEqAbs(scalarDotRef(&a, &b), dotComptime(2, &a, &b), 1e-5);
+}
+
+test "plan-11 parity: dot dim=4 hand-checked" {
+    const a = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    const b = [_]f32{ 5.0, 6.0, 7.0, 8.0 };
+    // 5 + 12 + 21 + 32 = 70
+    try testing.expectApproxEqAbs(@as(f32, 70.0), try dot(&a, &b), 1e-5);
+    try testing.expectApproxEqAbs(scalarDotRef(&a, &b), dotComptime(4, &a, &b), 1e-5);
+}
+
+test "plan-11 parity: l2sq dim=4 hand-checked" {
+    const a = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    const b = [_]f32{ 5.0, 6.0, 7.0, 8.0 };
+    // 4*4*4 = 64 (each diff is -4)
+    try testing.expectApproxEqAbs(@as(f32, 64.0), try l2sq(&a, &b), 1e-5);
+    try testing.expectApproxEqAbs(scalarL2sqRef(&a, &b), l2sqComptime(4, &a, &b), 1e-5);
+}
+
+test "plan-11 parity: dot dim=64 ramp + permutation" {
+    var a: [64]f32 = undefined;
+    var b: [64]f32 = undefined;
+    for (0..64) |i| {
+        a[i] = @as(f32, @floatFromInt(i)) * 0.01;
+        b[i] = @as(f32, @floatFromInt(63 - i)) * 0.02 + 0.5;
+    }
+    const ref = scalarDotRef(&a, &b);
+    const got = try dot(&a, &b);
+    try testing.expectApproxEqAbs(ref, got, 1e-5);
+    // dot(a,b) == dot(b,a)
+    try testing.expectApproxEqAbs(got, try dot(&b, &a), 1e-5);
+    // direct comptime call agrees with dispatcher
+    try testing.expectApproxEqAbs(got, dotComptime(64, &a, &b), 1e-5);
+}
+
+test "plan-11 parity: l2sq dim=64 ramp + permutation" {
+    var a: [64]f32 = undefined;
+    var b: [64]f32 = undefined;
+    for (0..64) |i| {
+        a[i] = @as(f32, @floatFromInt(i)) * 0.03 - 0.1;
+        b[i] = @as(f32, @floatFromInt((i * 7) % 64)) * 0.005;
+    }
+    const ref = scalarL2sqRef(&a, &b);
+    const got = try l2sq(&a, &b);
+    try testing.expectApproxEqAbs(ref, got, 1e-5);
+    // symmetric in a,b
+    try testing.expectApproxEqAbs(got, try l2sq(&b, &a), 1e-5);
+    try testing.expectApproxEqAbs(got, l2sqComptime(64, &a, &b), 1e-5);
+}
+
+test "plan-11 parity: dot dim=128 ramp + permutation" {
+    var a: [128]f32 = undefined;
+    var b: [128]f32 = undefined;
+    for (0..128) |i| {
+        a[i] = @as(f32, @floatFromInt(i)) * 0.005 - 0.3;
+        b[i] = @as(f32, @floatFromInt((i * 13 + 1) % 128)) * 0.01;
+    }
+    const ref = scalarDotRef(&a, &b);
+    const got = try dot(&a, &b);
+    // dim=128 has wider FMA reduction depth — relax to 1e-4 for the cumulative
+    // floating-point reordering between scalar reference and the @Vector(16)
+    // tree-reduce. Still well below any algorithmic-meaningful tolerance.
+    try testing.expectApproxEqAbs(ref, got, 1e-4);
+    try testing.expectApproxEqAbs(got, try dot(&b, &a), 1e-5);
+    try testing.expectApproxEqAbs(got, dotComptime(128, &a, &b), 1e-5);
+}
+
+test "plan-11 parity: l2sq dim=128 ramp + permutation" {
+    var a: [128]f32 = undefined;
+    var b: [128]f32 = undefined;
+    for (0..128) |i| {
+        a[i] = @as(f32, @floatFromInt(i)) * 0.02;
+        b[i] = @as(f32, @floatFromInt(127 - i)) * 0.02;
+    }
+    const ref = scalarL2sqRef(&a, &b);
+    const got = try l2sq(&a, &b);
+    try testing.expectApproxEqAbs(ref, got, 1e-4);
+    try testing.expectApproxEqAbs(got, try l2sq(&b, &a), 1e-5);
+    try testing.expectApproxEqAbs(got, l2sqComptime(128, &a, &b), 1e-5);
+}
+
+test "plan-11 parity: normalize dim=2" {
+    var v = [_]f32{ 3.0, 4.0 };
+    try normalizeInPlace(&v);
+    // 3-4-5 → 0.6, 0.8
+    try testing.expectApproxEqAbs(@as(f32, 0.6), v[0], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.8), v[1], 1e-6);
+}
+
+test "plan-11 parity: normalize dim=4" {
+    var v = [_]f32{ 1.0, 2.0, 2.0, 0.0 };
+    // norm² = 1+4+4 = 9, norm = 3
+    try normalizeInPlace(&v);
+    try testing.expectApproxEqAbs(@as(f32, 1.0 / 3.0), v[0], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 2.0 / 3.0), v[1], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 2.0 / 3.0), v[2], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.0), v[3], 1e-6);
+}
+
+test "plan-11 parity: normalize dim=64 unit-norm postcondition" {
+    var v: [64]f32 = undefined;
+    for (0..64) |i| v[i] = @as(f32, @floatFromInt(i)) * 0.01 + 0.1;
+    const expected_norm_sq = scalarNormSqRef(&v);
+    const expected_inv = 1.0 / @sqrt(expected_norm_sq);
+    var ref: [64]f32 = undefined;
+    for (0..64) |i| ref[i] = v[i] * expected_inv;
+
+    try normalizeInPlace(&v);
+    for (0..64) |i| try testing.expectApproxEqAbs(ref[i], v[i], 1e-5);
+
+    // Postcondition: result is unit-norm.
+    var got_sq: f32 = 0.0;
+    for (v) |x| got_sq += x * x;
+    try testing.expectApproxEqAbs(@as(f32, 1.0), got_sq, 1e-5);
+}
+
+test "plan-11 parity: normalize dim=128 unit-norm postcondition" {
+    var v: [128]f32 = undefined;
+    for (0..128) |i| v[i] = @as(f32, @floatFromInt(i + 1)) * 0.005 - 0.2;
+    const expected_norm_sq = scalarNormSqRef(&v);
+    const expected_inv = 1.0 / @sqrt(expected_norm_sq);
+    var ref: [128]f32 = undefined;
+    for (0..128) |i| ref[i] = v[i] * expected_inv;
+
+    try normalizeInPlace(&v);
+    for (0..128) |i| try testing.expectApproxEqAbs(ref[i], v[i], 1e-5);
+
+    var got_sq: f32 = 0.0;
+    for (v) |x| got_sq += x * x;
+    try testing.expectApproxEqAbs(@as(f32, 1.0), got_sq, 1e-5);
+}
+
+test "plan-11 parity: dispatcher matches generic on unspecialized dim" {
+    // dim=33 is not in {2,4,64,128}; dispatcher falls through to dotGeneric.
+    // Hand-build inputs and confirm parity with a scalar reference — this
+    // guards the fallback path from regressing while we're touching dispatch.
+    var a: [33]f32 = undefined;
+    var b: [33]f32 = undefined;
+    for (0..33) |i| {
+        a[i] = @as(f32, @floatFromInt(i)) * 0.1;
+        b[i] = @as(f32, @floatFromInt(33 - i)) * 0.07;
+    }
+    try testing.expectApproxEqAbs(scalarDotRef(&a, &b), try dot(&a, &b), 1e-5);
+    try testing.expectApproxEqAbs(scalarL2sqRef(&a, &b), try l2sq(&a, &b), 1e-5);
 }

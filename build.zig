@@ -75,6 +75,7 @@ pub fn build(b: *std.Build) void {
     inline for (.{
         .{ "bench_msmarco", "benchmarks/msmarco_v1.zig" },
         .{ "bench_lotte", "benchmarks/lotte_pooled.zig" },
+        .{ "microbench_vec", "benchmarks/microbench_vec.zig" },
     }) |entry| {
         const bench_mod = b.createModule(.{
             .root_source_file = b.path(entry[1]),
