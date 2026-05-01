@@ -51,31 +51,30 @@ both the surviving and dropped doc IDs.
 from __future__ import annotations
 
 import argparse
-import datetime as _dt
 import json
-import struct
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 
 # torch / pylate are imported lazily inside encode_docs() so the CLI's
 # --help and read_docs_jsonl path don't pay the multi-second import cost.
 
-
-TOKEN_DUMP_MAGIC = b"TAC_TKN1"  # must match src/constants.zig
-TOKEN_DUMP_VERSION = 2  # v2 = real vocab IDs (lead bumps src/constants.zig in lockstep)
-DTYPE_F32 = 0
-HEADER_SIZE = 40  # magic(8) + version(4) + dim(4) + n_docs(8) + n_tokens(8) + dtype(1) + reserved(7)
-
-# Format spec ceiling — must agree with parser in src/io/token_dump.zig.
-MAX_DIM = 4096
-
-
-@dataclass
-class EncodedDoc:
-    doc_id: str
-    token_ids: list[int]
-    vectors: list[list[float]]  # n_tokens × dim, L2-normalised
+# Shared writer + format constants — see tools/_tokens_bin.py. Re-exported
+# here so external callers that imported them from this module (or the
+# tests) keep working. Add the script's own directory to sys.path so the
+# import works regardless of cwd (encode.py is typically run as
+# `python tools/encode.py …` from the repo root).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _tokens_bin import (  # type: ignore  # noqa: E402
+    DTYPE_F32,
+    HEADER_SIZE,
+    MAX_DIM,
+    TOKEN_DUMP_MAGIC,
+    TOKEN_DUMP_VERSION,
+    EncodedDoc,
+    write_metadata as _write_metadata_shared,
+    write_qids_sidecar,
+    write_tokens_bin,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -408,78 +407,6 @@ def encode_docs(
     return encoded, dropped, dim
 
 
-def write_tokens_bin(out_path: Path, encoded: list[EncodedDoc], dim: int) -> dict:
-    """Write the flat binary; return summary stats for metadata."""
-    n_docs = len(encoded)
-    n_tokens = sum(len(d.token_ids) for d in encoded)
-    if n_tokens == 0:
-        raise SystemExit("aborting: 0 tokens after encoding")
-
-    # CSR-style doc_offsets.
-    doc_offsets = [0]
-    for d in encoded:
-        doc_offsets.append(doc_offsets[-1] + len(d.token_ids))
-    assert doc_offsets[-1] == n_tokens
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with out_path.open("wb") as f:
-        # Header.
-        f.write(TOKEN_DUMP_MAGIC)
-        f.write(struct.pack("<I", TOKEN_DUMP_VERSION))
-        f.write(struct.pack("<I", dim))
-        f.write(struct.pack("<Q", n_docs))
-        f.write(struct.pack("<Q", n_tokens))
-        f.write(struct.pack("<B", DTYPE_F32))
-        f.write(b"\x00" * 7)  # reserved
-        assert f.tell() == HEADER_SIZE
-
-        for o in doc_offsets:
-            f.write(struct.pack("<Q", o))
-
-        for d in encoded:
-            for tid in d.token_ids:
-                f.write(struct.pack("<I", int(tid)))
-
-        for d in encoded:
-            for vec in d.vectors:
-                if len(vec) != dim:
-                    raise SystemExit(
-                        f"internal: doc {d.doc_id!r} vector dim {len(vec)} != {dim}"
-                    )
-                for x in vec:
-                    f.write(struct.pack("<f", float(x)))
-
-    return {"n_docs": n_docs, "n_tokens": n_tokens, "dim": dim}
-
-
-def write_qids_sidecar(qids_path: Path, qid_strings: list[str]) -> None:
-    """In queries mode write a flat little-endian u32 array of length
-    `n_queries`, one entry per encoded query in the same order as the
-    binary's CSR row order. The bench harness reads this directly without
-    JSON parsing.
-
-    qids must be integer-parseable strings (MS MARCO + LoTTE both qualify).
-    Non-numeric qids fail-fast — the format is intentionally narrow so the
-    Zig loader stays a single `[]const u32` slice over an mmap region.
-    """
-    qids_path.parent.mkdir(parents=True, exist_ok=True)
-    with qids_path.open("wb") as f:
-        for q in qid_strings:
-            try:
-                qi = int(q)
-            except ValueError as e:
-                raise SystemExit(
-                    f"qid {q!r} is not int-parseable; .qids sidecar requires "
-                    "numeric qids (MS MARCO / LoTTE qualify)."
-                ) from e
-            if qi < 0 or qi > 0xFFFF_FFFF:
-                raise SystemExit(
-                    f"qid {qi} outside u32 range; .qids sidecar requires "
-                    "0 <= qid <= 2^32-1."
-                )
-            f.write(struct.pack("<I", qi))
-
-
 def write_metadata(
     meta_path: Path,
     *,
@@ -492,42 +419,21 @@ def write_metadata(
     dropped: list[tuple[str, str]],
     docs_jsonl: Path,
 ) -> None:
-    is_query = mode == "queries"
-    id_field = "qid" if is_query else "doc_id"
-    map_field = "qid_map" if is_query else "doc_id_map"
-    if is_query:
-        notes = [
-            "token_ids are real BERT vocabulary IDs from "
-            "tokenizer(text, is_query=True)['input_ids']: the ColBERT [Q] "
-            "prefix is preserved and ALL attended tokens are kept (no "
-            "skiplist drop on the query side, per paper §5). Format v2.",
-        ]
-    else:
-        notes = [
-            "token_ids are real BERT vocabulary IDs from "
-            "tokenizer(text)['input_ids'] with the ColBERT [D] prefix "
-            "preserved and skiplist (punctuation) tokens dropped, exactly "
-            "matching pylate.models.ColBERT.encode's keep-mask. Format v2.",
-        ]
-    meta = {
-        "format_version": TOKEN_DUMP_VERSION,
-        "mode": mode,
-        "encoder": model_name,
-        "encoder_dim": dim,
-        "n_docs": n_docs,
-        "n_tokens": n_tokens,
-        map_field: doc_ids,
-        "dropped": [{id_field: d, "reason": r} for d, r in dropped],
-        "built_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-        "tool": "tools/encode.py",
-        "tool_version": "0.3",
-        "source_jsonl": str(docs_jsonl),
-        "notes": notes,
-    }
-    meta_path.parent.mkdir(parents=True, exist_ok=True)
-    with meta_path.open("w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2, ensure_ascii=False)
-        f.write("\n")
+    """Thin wrapper that pins the `tool`/`tool_version` strings for this
+    encoder; everything else delegates to _tokens_bin.write_metadata."""
+    _write_metadata_shared(
+        meta_path,
+        mode=mode,
+        model_name=model_name,
+        dim=dim,
+        n_docs=n_docs,
+        n_tokens=n_tokens,
+        doc_ids=doc_ids,
+        dropped=dropped,
+        docs_jsonl=docs_jsonl,
+        tool="tools/encode.py",
+        tool_version="0.3",
+    )
 
 
 def main() -> None:
