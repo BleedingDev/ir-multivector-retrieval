@@ -18,6 +18,7 @@ pub const util = struct {
 
 pub const io = struct {
     pub const token_dump = @import("io/token_dump.zig");
+    pub const synthetic_fixture = @import("io/synthetic_fixture.zig");
 };
 
 pub const tac = @import("tac/tac.zig");
