@@ -172,13 +172,16 @@ pub fn train(
     errdefer gpa.free(codebooks);
 
     if (n_threads <= 1) {
-        // ---- Serial. ----
+        // ---- Serial across subspaces; within-subspace parallelism
+        // (plan-07) — we pass `n_threads` straight through so a `--threads 1`
+        // build still benefits from kmeans-side parallelism if it is bumped
+        // upstream. Today this is the same 1; preserved for symmetry.
         const sub_buf = try gpa.alloc(f32, n_residuals * @as(usize, sub_dim));
         defer gpa.free(sub_buf);
 
         var m: u32 = 0;
         while (m < constants.PQ_M) : (m += 1) {
-            try trainOneSubspace(residuals, dim, sub_dim, n_residuals, m, seed, sub_buf, codebooks, gpa);
+            try trainOneSubspace(residuals, dim, sub_dim, n_residuals, m, seed, n_threads, sub_buf, codebooks, gpa);
         }
     } else {
         // ---- Parallel: chunk M=32 across workers. ----
@@ -188,6 +191,7 @@ pub fn train(
             sub_dim: u32,
             n_residuals: usize,
             seed: u64,
+            kmeans_n_threads: u32,
             codebooks: []f32,
             gpa: Allocator,
             err_out: ?PqError,
@@ -203,7 +207,7 @@ pub fn train(
                 defer ctx.gpa.free(sub_buf);
                 var m = ctx.lo;
                 while (m < ctx.hi) : (m += 1) {
-                    trainOneSubspace(ctx.residuals, ctx.dim, ctx.sub_dim, ctx.n_residuals, m, ctx.seed, sub_buf, ctx.codebooks, ctx.gpa) catch |err| {
+                    trainOneSubspace(ctx.residuals, ctx.dim, ctx.sub_dim, ctx.n_residuals, m, ctx.seed, ctx.kmeans_n_threads, sub_buf, ctx.codebooks, ctx.gpa) catch |err| {
                         ctx.err_out = err;
                         return;
                     };
@@ -217,6 +221,19 @@ pub fn train(
         const threads = try gpa.alloc(std.Thread, real_threads);
         defer gpa.free(threads);
 
+        // Within-subspace parallelism (plan-07): when subspace-level
+        // parallelism already saturates the cores (n_threads <= real_threads
+        // = min(n_threads, PQ_M=32)) further inner workers only oversubscribe
+        // and lose to scheduling overhead — measured 113s → 121s at inner=10
+        // and 113s → 135s at inner=2 on M=32 / outer=10 / 10-core Apple Si.
+        // Reserve within-subspace parallelism for the case where the user's
+        // total thread budget exceeds M (n_threads > 32) — there's leftover
+        // budget to soak up inside each subspace's argmin loop.
+        const kmeans_inner: u32 = blk: {
+            if (n_threads <= real_threads) break :blk 1;
+            break :blk @max(1, n_threads / real_threads);
+        };
+
         const chunk = (constants.PQ_M + real_threads - 1) / real_threads;
         for (0..real_threads) |t| {
             const lo: u32 = @intCast(t * chunk);
@@ -227,6 +244,7 @@ pub fn train(
                 .sub_dim = sub_dim,
                 .n_residuals = n_residuals,
                 .seed = seed,
+                .kmeans_n_threads = kmeans_inner,
                 .codebooks = codebooks,
                 .gpa = gpa,
                 .err_out = null,
@@ -249,6 +267,11 @@ pub fn train(
 /// Train one PQ subspace's codebook. Materialises the m-th sub_dim columns
 /// of every residual into `sub_buf`, runs k=256 k-means, copies centroids
 /// into `codebooks[m*256*sub_dim..]`. Pure for distinct `m`.
+///
+/// `kmeans_n_threads` controls within-subspace parallelism (plan-07). At 1
+/// the kmeans loop is byte-identical to the pre-parallel path; at >=2 the
+/// argmin-per-vector step is sliced across worker threads but produces
+/// byte-equal centroids across thread counts (paper-strict reproducibility).
 fn trainOneSubspace(
     residuals: []const f32,
     dim: u32,
@@ -256,6 +279,7 @@ fn trainOneSubspace(
     n_residuals: usize,
     m: u32,
     seed: u64,
+    kmeans_n_threads: u32,
     sub_buf: []f32,
     codebooks: []f32,
     gpa: Allocator,
@@ -271,6 +295,7 @@ fn trainOneSubspace(
         .max_iters = 25,
         .tol = 1e-4,
         .seed = seed +% @as(u64, m),
+        .n_threads = kmeans_n_threads,
     }, gpa);
     defer res.deinit(gpa);
 

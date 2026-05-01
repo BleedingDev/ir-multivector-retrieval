@@ -30,6 +30,14 @@ pub const KMeansParams = struct {
     max_iters: u32 = 25,
     tol: f32 = 1e-4,
     seed: u64,
+    /// Worker threads for the per-vector assignment step (k-means' hot loop).
+    /// `1` short-circuits to the strictly-serial code path, byte-identical
+    /// to the pre-parallel implementation. `>=2` parallelises argmin across
+    /// a static chunk of vectors per thread; the cluster-sum accumulation
+    /// that feeds the centroid update runs serially in vector order, so the
+    /// produced centroids are **byte-equal** across any thread count for
+    /// the same seed (paper-strict reproducibility — see plan-07).
+    n_threads: u32 = 1,
 };
 
 pub const KMeansResult = struct {
@@ -49,7 +57,7 @@ pub const KMeansError = error{
     KmeansBudgetTooSmall,
     EmptyVectorSet,
     DimMismatch,
-} || Allocator.Error || vec.VecError || rng_mod.RngError;
+} || Allocator.Error || vec.VecError || rng_mod.RngError || std.Thread.SpawnError;
 
 /// Cluster `vectors` into `p.k` groups via Lloyd's algorithm, k-means++ seeded.
 ///
@@ -132,9 +140,9 @@ pub fn fit(
     defer gpa.free(cluster_sums);
     const cluster_counts = try gpa.alloc(u32, k);
     defer gpa.free(cluster_counts);
-    const centroid_dists = try gpa.alloc(f32, k);
-    defer gpa.free(centroid_dists);
-    // For empty-cluster re-seeding: per-vector min distance to any centroid.
+    // Per-vector min distance to its assigned centroid. Doubles as the
+    // WCSS-per-vector contribution that phase 2 (serial accumulation) reads
+    // in order, and as the empty-cluster re-seed key (`argmax(min_to_any)`).
     const min_to_any = try gpa.alloc(f32, n);
     defer gpa.free(min_to_any);
 
@@ -149,17 +157,27 @@ pub fn fit(
         @memset(cluster_sums, 0.0);
         @memset(cluster_counts, 0);
 
-        for (0..n) |i| {
-            const v_i = vectors[i * d ..][0..d];
-            for (0..k) |cc| {
-                centroid_dists[cc] = try vec.l2sq(v_i, centroids[cc * d ..][0..d]);
-            }
-            const a = try vec.argmin(centroid_dists);
-            assignments[i] = @intCast(a);
-            min_to_any[i] = centroid_dists[a];
-            wcss += centroid_dists[a];
+        // Phase 1: per-vector argmin. Optionally parallel across n_threads
+        // (plan-07). Pure per-vector so writes to `assignments` and
+        // `min_to_any` are byte-equal across thread counts.
+        try assignVectors(
+            vectors,
+            n,
+            d,
+            k,
+            centroids,
+            assignments,
+            min_to_any,
+            p.n_threads,
+            gpa,
+        );
 
-            // Accumulate sum for mean update (paper §3 / Lloyd's update step).
+        // Phase 2: serial accumulation in vector order. Fixed reduction
+        // order keeps centroids byte-equal across n_threads (paper-strict).
+        for (0..n) |i| {
+            const a: usize = assignments[i];
+            wcss += min_to_any[i];
+            const v_i = vectors[i * d ..][0..d];
             const sum_slot = cluster_sums[a * d ..][0..d];
             for (0..d) |dd| sum_slot[dd] += v_i[dd];
             cluster_counts[a] += 1;
@@ -207,6 +225,124 @@ pub fn fit(
         .wcss = wcss,
         .iters_run = iters_run,
     };
+}
+
+/// Assign every vector to its closest centroid (paper §3 / Lloyd's
+/// assignment step). Writes `assignments[i] = argmin_c d²(v_i, μ_c)` and
+/// `min_to_any[i] = d²(v_i, μ_{a(i)})`.
+///
+/// `n_threads <= 1` runs serially. `n_threads >= 2` slices the n vectors
+/// into static contiguous chunks and computes argmin in parallel. Argmin is
+/// pure per-vector, so the writes to `assignments` and `min_to_any` are
+/// byte-equal across thread counts — the deterministic f32-reduction order
+/// is enforced by the caller's serial accumulation pass that consumes these
+/// arrays in order.
+fn assignVectors(
+    vectors: []const f32,
+    n: usize,
+    d: usize,
+    k: usize,
+    centroids: []const f32,
+    assignments: []u32,
+    min_to_any: []f32,
+    n_threads: u32,
+    gpa: Allocator,
+) KMeansError!void {
+    const real_threads: u32 = if (n_threads <= 1) 1 else @intCast(@min(@as(usize, n_threads), n));
+    if (real_threads <= 1) {
+        const dists = try gpa.alloc(f32, k);
+        defer gpa.free(dists);
+        try assignSlice(vectors, 0, n, d, k, centroids, assignments, min_to_any, dists);
+        return;
+    }
+
+    const Ctx = struct {
+        vectors: []const f32,
+        d: usize,
+        k: usize,
+        centroids: []const f32,
+        assignments: []u32,
+        min_to_any: []f32,
+        lo: usize,
+        hi: usize,
+        gpa: Allocator,
+        err_out: ?KMeansError,
+    };
+    const Runner = struct {
+        fn run(ctx: *Ctx) void {
+            const dists = ctx.gpa.alloc(f32, ctx.k) catch |err| {
+                ctx.err_out = err;
+                return;
+            };
+            defer ctx.gpa.free(dists);
+            assignSlice(
+                ctx.vectors,
+                ctx.lo,
+                ctx.hi,
+                ctx.d,
+                ctx.k,
+                ctx.centroids,
+                ctx.assignments,
+                ctx.min_to_any,
+                dists,
+            ) catch |err| {
+                ctx.err_out = err;
+                return;
+            };
+        }
+    };
+
+    const ctxs = try gpa.alloc(Ctx, real_threads);
+    defer gpa.free(ctxs);
+    const threads = try gpa.alloc(std.Thread, real_threads);
+    defer gpa.free(threads);
+
+    const chunk: usize = (n + real_threads - 1) / real_threads;
+    var t: u32 = 0;
+    while (t < real_threads) : (t += 1) {
+        const lo: usize = @as(usize, t) * chunk;
+        const hi: usize = @min(lo + chunk, n);
+        ctxs[t] = .{
+            .vectors = vectors,
+            .d = d,
+            .k = k,
+            .centroids = centroids,
+            .assignments = assignments,
+            .min_to_any = min_to_any,
+            .lo = lo,
+            .hi = hi,
+            .gpa = gpa,
+            .err_out = null,
+        };
+        threads[t] = try std.Thread.spawn(.{}, Runner.run, .{&ctxs[t]});
+    }
+    for (threads) |th| th.join();
+    for (ctxs) |c| if (c.err_out) |err| return err;
+}
+
+/// Per-slice argmin: writes `assignments[i]` and `min_to_any[i]` for
+/// `i in [lo, hi)`. `dists` is a `k`-length scratch buffer (caller-owned).
+fn assignSlice(
+    vectors: []const f32,
+    lo: usize,
+    hi: usize,
+    d: usize,
+    k: usize,
+    centroids: []const f32,
+    assignments: []u32,
+    min_to_any: []f32,
+    dists: []f32,
+) KMeansError!void {
+    var i: usize = lo;
+    while (i < hi) : (i += 1) {
+        const v_i = vectors[i * d ..][0..d];
+        for (0..k) |cc| {
+            dists[cc] = try vec.l2sq(v_i, centroids[cc * d ..][0..d]);
+        }
+        const a = try vec.argmin(dists[0..k]);
+        assignments[i] = @intCast(a);
+        min_to_any[i] = dists[a];
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -289,6 +425,44 @@ test "fit: 3 well-separated 2D blobs recover blob means" {
         }
         try testing.expect(found);
     }
+}
+
+test "fit: parallel n_threads byte-equal to serial path (paper-strict)" {
+    // Plan-07 gate: same seed + same vectors must produce byte-equal
+    // centroids and assignments at any n_threads. Argmin is per-vector pure;
+    // the f32-accumulating update step runs serially in vector order, so
+    // reductions are bit-stable across thread counts.
+    const a = std.testing.allocator;
+    const dim: u32 = 4;
+    const n: u32 = 600;
+    const buf = try a.alloc(f32, @as(usize, n) * @as(usize, dim));
+    defer a.free(buf);
+    var prng = std.Random.DefaultPrng.init(0xDE7E2);
+    for (buf) |*x| x.* = prng.random().floatNorm(f32);
+
+    var r1 = try fit(buf, dim, .{ .k = 32, .seed = 42, .n_threads = 1, .max_iters = 25 }, a);
+    defer r1.deinit(a);
+    var r10 = try fit(buf, dim, .{ .k = 32, .seed = 42, .n_threads = 10, .max_iters = 25 }, a);
+    defer r10.deinit(a);
+
+    try testing.expectEqualSlices(f32, r1.centroids, r10.centroids);
+    try testing.expectEqualSlices(u32, r1.assignments, r10.assignments);
+    try testing.expectEqual(r1.wcss, r10.wcss);
+    try testing.expectEqual(r1.iters_run, r10.iters_run);
+
+    // And again at sub_dim=1 (the PQ shape with dim/PQ_M=64/32=2 → 1 here for tightness).
+    var r3 = try fit(buf, dim, .{ .k = 32, .seed = 42, .n_threads = 3, .max_iters = 25 }, a);
+    defer r3.deinit(a);
+    try testing.expectEqualSlices(f32, r1.centroids, r3.centroids);
+    try testing.expectEqualSlices(u32, r1.assignments, r3.assignments);
+
+    // Edge case: n_threads > n. Must clamp to n internally and still match.
+    const small = buf[0 .. 5 * @as(usize, dim)];
+    var s1 = try fit(small, dim, .{ .k = 3, .seed = 7, .n_threads = 1 }, a);
+    defer s1.deinit(a);
+    var s_huge = try fit(small, dim, .{ .k = 3, .seed = 7, .n_threads = 64 }, a);
+    defer s_huge.deinit(a);
+    try testing.expectEqualSlices(f32, s1.centroids, s_huge.centroids);
 }
 
 test "fit: deterministic - same seed produces byte-equal centroids" {
