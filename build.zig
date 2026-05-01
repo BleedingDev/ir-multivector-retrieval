@@ -67,4 +67,30 @@ pub fn build(b: *std.Build) void {
         const run_live_tests = b.addRunArtifact(live_tests);
         test_step.dependOn(&run_live_tests.step);
     }
+
+    // Per-dataset benchmark executables (paper §6 Table 1 reproduction harness).
+    // Each consumes pre-encoded tokens.bin + qrels.tsv at runtime; not part of
+    // `zig build test`. Invoke with e.g. `zig build run-bench_msmarco -- <args>`.
+    // .zig sources are retriever-owned; build.zig wiring is lead-owned (#28).
+    inline for (.{
+        .{ "bench_msmarco", "benchmarks/msmarco_v1.zig" },
+        .{ "bench_lotte", "benchmarks/lotte_pooled.zig" },
+    }) |entry| {
+        const bench_mod = b.createModule(.{
+            .root_source_file = b.path(entry[1]),
+            .target = target,
+            .optimize = optimize,
+        });
+        bench_mod.addImport("tac", lib_mod);
+        const bench_exe = b.addExecutable(.{
+            .name = entry[0],
+            .root_module = bench_mod,
+        });
+        b.installArtifact(bench_exe);
+        const run_bench = b.addRunArtifact(bench_exe);
+        run_bench.step.dependOn(b.getInstallStep());
+        if (b.args) |args| run_bench.addArgs(args);
+        const bench_step = b.step("run-" ++ entry[0], "Run the " ++ entry[0] ++ " harness");
+        bench_step.dependOn(&run_bench.step);
+    }
 }

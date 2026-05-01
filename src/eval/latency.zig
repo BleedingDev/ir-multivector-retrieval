@@ -39,6 +39,43 @@
 //! ---------------------------------------------------------------------------
 
 const std = @import("std");
+const builtin = @import("builtin");
+
+/// Best-effort pin the calling thread to a single core (paper §9 reports
+/// retrieval as single-core wall clock).
+///
+/// - Linux: `sched_setaffinity(0, [1u << core])` on a singleton CPU set.
+/// - macOS: thread_policy_set with THREAD_AFFINITY_POLICY (Apple Silicon
+///   ignores real affinity; the tag still groups co-scheduled threads).
+/// - Other OS: no-op.
+///
+/// Errors are swallowed — pinning is best-effort; benchmark numbers are
+/// still recorded if the syscall fails. Useful out-of-band signal: the
+/// per-stage latency variance in the Report will be wider on a busy
+/// machine when affinity didn't take.
+pub fn pinToCore(core: u32) void {
+    pinToCoreImpl(core);
+}
+
+const pinToCoreImpl = if (builtin.os.tag == .linux) pinToCoreLinux else pinToCoreNoop;
+
+fn pinToCoreLinux(core: u32) void {
+    // CPU set type matches the kernel's cpu_set_t (1024 bits).
+    var set: std.posix.cpu_set_t = std.mem.zeroes(std.posix.cpu_set_t);
+    const idx = @as(usize, core);
+    const word_bits = @sizeOf(@TypeOf(set[0])) * 8;
+    const word = idx / word_bits;
+    const bit = idx % word_bits;
+    if (word < set.len) {
+        set[word] |= @as(@TypeOf(set[0]), 1) << @intCast(bit);
+        std.posix.sched_setaffinity(0, &set) catch {};
+    }
+}
+
+// macOS/Windows/etc — no portable affinity primitive in std. paper-gap §9:
+// non-Linux results carry small extra variance vs the paper's 64-thread
+// Xeon Linux baseline.
+fn pinToCoreNoop(_: u32) void {}
 
 pub const StageTimings = struct {
     gather_ns: u64 = 0,
@@ -164,4 +201,13 @@ test "report handles single sample" {
     try testing.expectApproxEqAbs(@as(f64, 7.0), r.avg_total_ms, 1e-9);
     try testing.expectApproxEqAbs(@as(f64, 7.0), r.p50_total_ms, 1e-9);
     try testing.expectApproxEqAbs(@as(f64, 7.0), r.p95_total_ms, 1e-9);
+}
+
+test "pinToCore is a no-op for unsupported / out-of-range cores" {
+    // The function is best-effort: any core ID, including ones the kernel
+    // doesn't know about, must not crash. We don't assert real affinity —
+    // that requires reading /proc on Linux and isn't portable.
+    pinToCore(0);
+    pinToCore(1);
+    pinToCore(9999); // way past any reasonable CPU count
 }

@@ -3,94 +3,96 @@
 //! Owner: retriever. Target operating point (paper Table 1):
 //!   - Success@5 = 67.5 → 11 ms/query
 //!
-//! Same shape as msmarco_v1.zig, but uses Success@5 as the metric. See
-//! benchmarks/README.md for the runbook and `src/retrieval/bench.zig` for
-//! the sweep core.
+//! Same shape as msmarco_v1.zig, but uses Success@5 as the metric.
+//! See benchmarks/README.md for the runbook.
 
 const std = @import("std");
 const tac = @import("tac");
+const runner = @import("common/runner.zig");
 
-const Args = struct {
-    index_path: []const u8,
-    queries_path: []const u8,
-    qrels_path: []const u8,
-    out_path: []const u8,
-};
-
-fn parseArgs(gpa: std.mem.Allocator) !Args {
-    const argv = try std.process.argsAlloc(gpa);
-    defer std.process.argsFree(gpa, argv);
-
-    var args = Args{
-        .index_path = "",
-        .queries_path = "",
-        .qrels_path = "",
-        .out_path = "",
-    };
-    var i: usize = 1;
-    while (i < argv.len) : (i += 1) {
-        const a = argv[i];
-        if (std.mem.eql(u8, a, "--index") and i + 1 < argv.len) {
-            args.index_path = try gpa.dupe(u8, argv[i + 1]);
-            i += 1;
-        } else if (std.mem.eql(u8, a, "--queries") and i + 1 < argv.len) {
-            args.queries_path = try gpa.dupe(u8, argv[i + 1]);
-            i += 1;
-        } else if (std.mem.eql(u8, a, "--qrels") and i + 1 < argv.len) {
-            args.qrels_path = try gpa.dupe(u8, argv[i + 1]);
-            i += 1;
-        } else if (std.mem.eql(u8, a, "--out") and i + 1 < argv.len) {
-            args.out_path = try gpa.dupe(u8, argv[i + 1]);
-            i += 1;
-        } else {
-            std.debug.print("unknown arg: {s}\n", .{a});
-            return error.BadArgs;
-        }
-    }
-    if (args.index_path.len == 0 or args.queries_path.len == 0 or
-        args.qrels_path.len == 0 or args.out_path.len == 0)
-    {
-        std.debug.print(
-            \\lotte_pooled: missing required args.
-            \\  --index PATH    serialised .tac index file
-            \\  --queries PATH  encoded queries.bin (token_dump format)
-            \\  --qrels PATH    qrels.tsv
-            \\  --out PATH      output CSV
-            \\
-        , .{});
-        return error.BadArgs;
-    }
-    return args;
+fn die(msg: []const u8) noreturn {
+    std.debug.print("{s}\n", .{msg});
+    std.process.exit(2);
 }
 
-pub fn main() !void {
-    var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
+fn parseArgs(m: std.process.Init.Minimal, gpa: std.mem.Allocator) !runner.RunArgs {
+    var iter = try std.process.Args.Iterator.initAllocator(m.args, gpa);
+    defer iter.deinit();
+    _ = iter.next();
+
+    var index_path: []const u8 = "";
+    var queries_path: []const u8 = "";
+    var qids_path: []const u8 = "";
+    var qrels_path: []const u8 = "";
+    var out_csv: []const u8 = "";
+    var git_sha: []const u8 = "unknown";
+
+    while (iter.next()) |a| {
+        if (std.mem.eql(u8, a, "--index")) {
+            const v = iter.next() orelse die("--index needs a path");
+            index_path = try gpa.dupe(u8, v);
+        } else if (std.mem.eql(u8, a, "--queries")) {
+            const v = iter.next() orelse die("--queries needs a path");
+            queries_path = try gpa.dupe(u8, v);
+        } else if (std.mem.eql(u8, a, "--qids")) {
+            const v = iter.next() orelse die("--qids needs a path");
+            qids_path = try gpa.dupe(u8, v);
+        } else if (std.mem.eql(u8, a, "--qrels")) {
+            const v = iter.next() orelse die("--qrels needs a path");
+            qrels_path = try gpa.dupe(u8, v);
+        } else if (std.mem.eql(u8, a, "--out")) {
+            const v = iter.next() orelse die("--out needs a path");
+            out_csv = try gpa.dupe(u8, v);
+        } else if (std.mem.eql(u8, a, "--git-sha")) {
+            const v = iter.next() orelse die("--git-sha needs a value");
+            git_sha = try gpa.dupe(u8, v);
+        } else {
+            std.debug.print("unknown arg: {s}\n", .{a});
+            die("unknown arg; required: --index --queries --qids --qrels --out [--git-sha]");
+        }
+    }
+    if (index_path.len == 0 or queries_path.len == 0 or qids_path.len == 0 or
+        qrels_path.len == 0 or out_csv.len == 0)
+    {
+        die(
+            \\bench_lotte: missing required args.
+            \\  --index PATH    .tac index file
+            \\  --queries PATH  encoded queries.bin (token_dump format)
+            \\  --qids PATH     queries.bin.qids sidecar
+            \\  --qrels PATH    qrels.tsv
+            \\  --out PATH      output CSV
+            \\  [--git-sha SHA] traceability tag
+        );
+    }
+    return .{
+        .dataset = "lotte-pooled",
+        .index_path = index_path,
+        .queries_path = queries_path,
+        .qids_path = qids_path,
+        .qrels_path = qrels_path,
+        .out_csv_path = out_csv,
+        .git_sha = git_sha,
+        .metric = .success_at_5,
+        .min_rel = 1,
+        .pin_core = 0,
+    };
+}
+
+pub fn main(m: std.process.Init.Minimal) !void {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
 
-    const args = try parseArgs(gpa);
+    const args = try parseArgs(m, gpa);
     defer {
         gpa.free(args.index_path);
         gpa.free(args.queries_path);
+        gpa.free(args.qids_path);
         gpa.free(args.qrels_path);
-        gpa.free(args.out_path);
+        gpa.free(args.out_csv_path);
+        if (!std.mem.eql(u8, args.git_sha, "unknown")) gpa.free(args.git_sha);
     }
+    _ = tac.retrieval.bench.csv_header;
 
-    std.debug.print(
-        \\lotte_pooled harness: parsed args.
-        \\  index   = {s}
-        \\  queries = {s}
-        \\  qrels   = {s}
-        \\  out     = {s}
-        \\
-        \\Real-data loaders not yet implemented — see benchmarks/README.md
-        \\for the runbook. The sweep core itself (`tac.retrieval.bench`) is
-        \\ready and unit-tested on the synthetic fixture.
-        \\
-    , .{ args.index_path, args.queries_path, args.qrels_path, args.out_path });
-
-    _ = tac.retrieval.bench.kappa_c_grid;
-    _ = tac.retrieval.bench.alpha_grid;
-
-    return error.NotImplemented;
+    try runner.runDatasetSweep(args, gpa);
 }
