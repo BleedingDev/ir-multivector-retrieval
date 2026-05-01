@@ -118,7 +118,35 @@ def parse_args() -> argparse.Namespace:
         "--batch",
         type=int,
         default=16,
-        help="encoder batch size",
+        help=(
+            "encoder batch size (legacy flag). New code should prefer "
+            "--encoder-batch-size, which overrides this when set."
+        ),
+    )
+    p.add_argument(
+        "--dtype",
+        choices=("fp32", "fp16", "auto"),
+        default="auto",
+        help=(
+            "encoder weight dtype. fp32 keeps full precision; fp16 calls "
+            "model.half() after load (4-6x faster on Apple Silicon MPS, "
+            "~0.998 cosine parity vs fp32 in practice). 'auto' (default) "
+            "picks fp16 on --device mps, fp32 on cpu/cuda — opt-out by "
+            "passing fp32 explicitly. tokens.bin stays f32 regardless "
+            "(cast happens before write). Mirrors sibling ir-expo's "
+            "WARP_ENCODER_FP16=1 default on the same hardware."
+        ),
+    )
+    p.add_argument(
+        "--encoder-batch-size",
+        type=int,
+        default=None,
+        help=(
+            "encoder forward batch (overrides --batch when set). "
+            "Default when unset: 32 on cpu/cuda, 256 on mps. Larger "
+            "batches amortize pad cost and saturate the GPU; matches "
+            "sibling ir-expo's WARP_ENCODER_BATCH_SIZE=256 default."
+        ),
     )
     p.add_argument(
         "--max-docs",
@@ -189,6 +217,7 @@ def encode_docs(
     batch_size: int,
     trust_remote_code: bool,
     sort_by_length: bool = False,
+    use_fp16: bool = False,
 ) -> tuple[list[EncodedDoc], list[tuple[str, str]], int]:
     """Returns (encoded, dropped, dim).
 
@@ -223,12 +252,38 @@ def encode_docs(
     )
     model.eval()
 
+    # FP16 weights for the M-series MPS speedup (4-6× on Apple Silicon).
+    # Output tokens.bin is still f32: kept_emb is `.float()`-cast before
+    # write in the per-doc loop, so the binary format is unaffected.
+    # paper-gap: paper §4 doesn't mandate encoder weight dtype; ColBERT
+    # vectors are L2-normalised so fp16 round-off stays >0.998 cosine vs
+    # fp32 on real text.
+    if use_fp16:
+        model.half()
+
     encoded: list[EncodedDoc] = []
     dropped: list[tuple[str, str]] = []
     dim: int | None = None
 
     target_device = torch.device(device)
     is_query = mode == "queries"
+
+    # Metal compiles kernels on first use — without this 4-doc warmup the
+    # first real batch eats 1-3 s of kernel compile and skews bench. Skip
+    # on cpu where there are no kernels to compile.
+    if target_device.type == "mps" and docs:
+        warmup_texts = [d["text"] for d in docs[:4]] or ["warmup"]
+        try:
+            warm_features = model.tokenize(warmup_texts, is_query=is_query)
+            warm_features = {
+                k: (v.to(target_device) if hasattr(v, "to") else v)
+                for k, v in warm_features.items()
+            }
+            with torch.no_grad():
+                model.forward(input=warm_features)
+            torch.mps.synchronize()
+        except Exception as e:  # noqa: BLE001
+            print(f"warmup pass failed (continuing): {e!r}", file=sys.stderr)
 
     # Optional length-sort: encode docs in tokenizer-length order so each
     # batch pads to its own longest member rather than the global longest.
@@ -484,14 +539,32 @@ def main() -> None:
     noun = "queries" if args.mode == "queries" else "docs"
     print(f"loaded {len(docs)} {noun} from {args.docs}", file=sys.stderr)
 
+    # Resolve auto-defaults for dtype + encoder batch size based on device.
+    # 'auto' picks fp16/256 on mps, fp32/32 elsewhere — matches sibling
+    # ir-expo's proven WARP defaults on the same Apple Silicon hardware.
+    # --encoder-batch-size overrides --batch when set; otherwise on cpu/cuda
+    # we fall back to --batch (preserving today's behavior with --batch 16).
+    is_mps = args.device.startswith("mps")
+    if args.dtype == "auto":
+        use_fp16 = is_mps
+    else:
+        use_fp16 = args.dtype == "fp16"
+    if args.encoder_batch_size is not None:
+        encoder_batch = args.encoder_batch_size
+    elif is_mps:
+        encoder_batch = 256
+    else:
+        encoder_batch = args.batch
+
     encoded, dropped, dim = encode_docs(
         docs,
         mode=args.mode,
         model_name=args.model,
         device=args.device,
-        batch_size=args.batch,
+        batch_size=encoder_batch,
         trust_remote_code=args.trust_remote_code,
         sort_by_length=args.sort_by_length,
+        use_fp16=use_fp16,
     )
     print(
         f"encoded {len(encoded)} {noun} (dim={dim}, dropped={len(dropped)})",

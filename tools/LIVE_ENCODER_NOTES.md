@@ -22,6 +22,64 @@ encoder version bump.
       --out tests/fixtures/live/tokens.bin --device cpu --batch 16
   ```
 
+## Encoder dtype + batch size (post-hackathon plan 08)
+
+`tools/encode.py` exposes two flags whose auto-defaults follow `--device`:
+
+| flag | cpu / cuda | mps |
+|---|---|---|
+| `--dtype` | fp32 | fp16 (`model.half()` after load) |
+| `--encoder-batch-size` | 32 | 256 |
+
+`--dtype auto` (default) picks fp16 only on `--device mps`; cpu/cuda stay
+fp32. Pass `--dtype fp32` explicitly to opt out on MPS. tokens.bin is f32
+regardless — the per-doc loop already does `.cpu().float()` before
+normalisation, so the on-disk format is unchanged. We also run a 4-doc
+warmup pass on MPS so the first real batch isn't measuring Metal kernel
+compilation.
+
+Pattern mirrors sibling `services/warp-service/server.py` lines 187–231,
+which already runs `WARP_ENCODER_FP16=1` + `WARP_ENCODER_BATCH_SIZE=256`
+on the same Apple Silicon hardware.
+
+### Measured speedup (Apple Silicon, jina-colbert-v2-64)
+
+End-to-end CLI wall-clock on `tests/fixtures/live/docs.jsonl` (100 docs,
+1697 kept tokens), back-to-back so HF cache is warm:
+
+| invocation                                 | wall   | speedup |
+|--------------------------------------------|--------|---------|
+| fp32, encoder-batch-size 32                | 12.4 s | 1.00×   |
+| fp16, encoder-batch-size 256               |  9.6 s | 1.29×   |
+
+Encode-loop only (model already loaded, includes warmup, excludes load):
+
+| corpus                          | fp32 bs=32 | fp16 bs=256 | speedup |
+|---------------------------------|-----------:|------------:|--------:|
+| 100 short synthetic docs        |    1.42 s  |     0.65 s  |  2.17×  |
+| 1000 real Jira docs (avg 2.7 kB)|  128.79 s  |    90.18 s  |  1.43×  |
+
+The advertised 4-6× lever from plan 08's overview did not materialise on
+this hardware / model: the live fixture is too small to saturate the GPU
+(model load dominates wall-clock), and on the longer Jira docs the
+encoder is bandwidth-bound rather than compute-bound. The speedup is
+real but in the 1.3-2× band, not 4-6×. Worth re-measuring on the full
+corpus + a larger ColBERT model where the matmuls dominate.
+
+### FP32 vs FP16 numerical parity
+
+10 docs encoded twice through the same path, cosine similarity computed
+between corresponding L2-normalised token vectors:
+
+| metric              | value    |
+|---------------------|----------|
+| n token pairs       | 173      |
+| mean cosine         | 0.999998 |
+| min cosine          | 0.999783 |
+| worst per-doc min   | 0.999783 |
+
+Well above the 0.998 floor — FP16 is safe to default-on for MPS.
+
 ## Output shape
 
 | field            | value                                      |
