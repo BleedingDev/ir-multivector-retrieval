@@ -538,19 +538,62 @@ def encode_docs_mlx(
     slots: list[EncodedDoc | None] = [None] * n
     dropped: list[tuple[str, str]] = []
 
-    for batch_start in range(0, n, batch_size):
-        batch_indices = order[batch_start : batch_start + batch_size]
-        batch = [docs[i] for i in batch_indices]
-        texts = [d["text"] for d in batch]
-        try:
-            features = tokenize_docs(texts)
-            input_ids_pt = features["input_ids"]
-            attn_pt = features["attention_mask"]
-            type_ids_pt = features["token_type_ids"]
+    # Producer thread: tokenize batch N+1 while the main thread runs MLX
+    # forward + post-process for batch N. HF fast tokenizers are pure CPU
+    # (Rust-backed, reentrant) and the queue is bounded so order is
+    # strictly preserved by the single producer / single consumer
+    # protocol. Determinism gate (parity gate 3) is the regression guard.
+    import queue as _queue
+    import threading as _threading
 
-            input_ids = mx.array(input_ids_pt.cpu().numpy().astype("int32"))
-            attn = mx.array(attn_pt.cpu().numpy().astype("int32"))
-            type_ids = mx.array(type_ids_pt.cpu().numpy().astype("int32"))
+    batches_iter = []  # precompute (batch_start, batch_indices, batch, texts) tuples
+    for batch_start in range(0, n, batch_size):
+        bi = order[batch_start : batch_start + batch_size]
+        b = [docs[i] for i in bi]
+        batches_iter.append((batch_start, bi, b, [d["text"] for d in b]))
+
+    # maxsize=2: producer can stay one batch ahead. Larger queues just
+    # buy more memory for no extra throughput once the producer is
+    # faster than the consumer (which it should be for tokenize-only).
+    pre_queue: _queue.Queue = _queue.Queue(maxsize=2)
+    producer_err: list[BaseException] = []
+
+    def _producer() -> None:
+        try:
+            for item in batches_iter:
+                _, _, _, texts = item
+                features = tokenize_docs(texts)
+                # Pre-compute numpy views the consumer needs anyway —
+                # these are zero-copy off the torch tensors.
+                ids_np = features["input_ids"].cpu().numpy()
+                attn_np = features["attention_mask"].cpu().numpy()
+                type_ids_np = features["token_type_ids"].cpu().numpy()
+                pre_queue.put((item, ids_np, attn_np, type_ids_np))
+            pre_queue.put(None)  # sentinel
+        except BaseException as e:  # noqa: BLE001
+            producer_err.append(e)
+            try:
+                pre_queue.put(None)
+            except Exception:
+                pass
+
+    producer = _threading.Thread(target=_producer, name="mlx-tokenize", daemon=True)
+    producer.start()
+
+    while True:
+        msg = pre_queue.get()
+        if msg is None:
+            if producer_err:
+                raise SystemExit(
+                    f"tokenize-producer thread failed: {producer_err[0]!r}"
+                ) from producer_err[0]
+            break
+        item, ids_np, attn_np, type_ids_np = msg
+        batch_start, batch_indices, batch, _texts = item
+        try:
+            input_ids = mx.array(ids_np.astype("int32", copy=False))
+            attn = mx.array(attn_np.astype("int32", copy=False))
+            type_ids = mx.array(type_ids_np.astype("int32", copy=False))
 
             tok_emb = model(input_ids, attn, type_ids)  # [B, T, dim]
             # Force evaluation so we have concrete arrays for slicing.
@@ -567,9 +610,7 @@ def encode_docs_mlx(
                 dropped.append((str(d["doc_id"]), f"batch encode failed: {e!r}"))
             continue
 
-        # Apply keep mask (skiplist & attention_mask) per row.
-        ids_np = input_ids_pt.cpu().numpy()
-        attn_np = attn_pt.cpu().numpy()
+        # ids_np / attn_np already in hand from the producer.
         emb_np = tok_emb.astype(mx.float32)
         # mlx.array → host: numpy view (zero-copy when supported by MLX).
         emb_arr = np.array(emb_np, copy=False)

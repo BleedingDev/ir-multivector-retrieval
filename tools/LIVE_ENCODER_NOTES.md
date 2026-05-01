@@ -558,6 +558,33 @@ was a fixed per-process cost, so the relative win is approximately
 `pylate_load_s / total_wall_s`, which is largest on small jobs but still
 double-digit on 15-second jobs.
 
+### Rec #6 — producer-thread tokenization overlap
+
+`encode_docs_mlx` previously did tokenize → torch→numpy → MLX-array
+build → forward → eval → post-process serially per batch. With the
+hand-rolled `tokenize_docs` from rec-#1, the tokenize + numpy steps are
+pure-CPU and easy to push off the critical path. A daemon thread now
+pre-tokenizes the next batch (and pre-builds the numpy views the
+consumer needs anyway) into a `queue.Queue(maxsize=2)`. The main
+thread pulls, builds the MLX arrays, and runs forward.
+
+Determinism guard: HF fast tokenizers are Rust-backed and reentrant;
+the queue is single-producer / single-consumer with bounded size, so
+batch order is strictly preserved. Five back-to-back fp16 encodes of
+the live fixture produce byte-identical SHA-256 hashes. Parity gate 3
+(byte-equal two-run determinism) stayed green across the change.
+
+| cell | rec-#1 median | rec-#6 median | rec-#6 min | delta vs rec-#1 |
+|---|---:|---:|---:|---:|
+| 100-doc fp16 b=128                | 4.44s | 2.80s | 2.73s | **-37%** |
+| 1000-doc fp16 b=128 + sort        | 8.89s | 4.19s | 4.12s | **-53%** |
+
+Bigger than the consult's optimistic 15-30%. Likely cause: the
+torch-tensor → numpy step in the original sequential loop was holding
+the GIL for ~10s of ms per batch (8 batches at b=128 on the 1000-doc
+job) and forcing MLX dispatch to wait. Producer thread releases that
+contention, so MLX dispatch saturates more cleanly.
+
 ## Failure modes worth flagging
 
 - If a future pylate revision breaks the `model.tokenize` →
