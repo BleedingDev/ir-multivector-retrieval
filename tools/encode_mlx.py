@@ -409,7 +409,15 @@ def encode_docs_mlx(
     _load_weights_into_model(model, weights)
     model.eval()
 
-    skip_set = set(int(s) for s in skiplist)
+    # Vocab-size bool LUT: skip_lut[v] == True iff token id v is in skiplist.
+    # Lets us compute the per-batch keep mask via fancy indexing rather than
+    # a Python "int(id) in skip_set" loop.
+    vocab_size = int(cfg["vocab_size"])
+    skip_lut = np.zeros(vocab_size, dtype=bool)
+    for s in skiplist:
+        si = int(s)
+        if 0 <= si < vocab_size:
+            skip_lut[si] = True
 
     dim = cfg["projection_out"]
 
@@ -466,26 +474,24 @@ def encode_docs_mlx(
         # mlx.array → host: numpy view (zero-copy when supported by MLX).
         emb_arr = np.array(emb_np, copy=False)
 
+        # Vectorized keep mask: attn==1 AND not in skiplist. Uses the
+        # vocab-LUT so the "in skiplist?" check is a single fancy index.
+        keep_mask = (attn_np == 1) & (~skip_lut[ids_np])
+
         for b, (orig_i, d) in enumerate(zip(batch_indices, batch)):
             try:
-                row_ids = ids_np[b]
-                row_attn = attn_np[b]
-                kept_idx = [
-                    i
-                    for i in range(len(row_ids))
-                    if row_attn[i] == 1 and int(row_ids[i]) not in skip_set
-                ]
-                if not kept_idx:
+                row_keep = keep_mask[b]
+                if not row_keep.any():
                     dropped.append((str(d["doc_id"]), "0-token output after masking"))
                     continue
-                kept_ids = [int(row_ids[i]) for i in kept_idx]
-                kept_emb = emb_arr[b, kept_idx, :]
-                # Cast to float32 list-of-list for the shared writer.
-                vectors = kept_emb.astype("float32").tolist()
+                kept_ids = ids_np[b][row_keep].astype(int).tolist()
+                # f32-contiguous numpy [n_kept, dim]; the writer's bulk path
+                # consumes this without re-packing per float.
+                kept_vecs = np.ascontiguousarray(emb_arr[b][row_keep], dtype=np.float32)
                 slots[orig_i] = EncodedDoc(
                     doc_id=str(d["doc_id"]),
                     token_ids=kept_ids,
-                    vectors=vectors,
+                    vectors=kept_vecs,
                 )
             except Exception as e:  # noqa: BLE001
                 dropped.append((str(d["doc_id"]), f"post-process failed: {e!r}"))

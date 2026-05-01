@@ -33,11 +33,15 @@ class EncodedDoc:
     Both encode.py (pylate/torch) and encode_mlx.py (MLX) build this and
     hand it to write_tokens_bin. token_ids are real BERT vocabulary IDs;
     vectors are L2-normalised f32 row-major n_tokens × dim.
+
+    `vectors` accepts either list[list[float]] (legacy encode.py path) or a
+    numpy.ndarray of shape (n_tokens, dim) and dtype float32 (encode_mlx.py
+    fast path). The writer picks a bulk-write path when given numpy.
     """
 
     doc_id: str
     token_ids: list[int]
-    vectors: list[list[float]]
+    vectors: object  # list[list[float]] | numpy.ndarray (f32 [n,dim])
 
 
 def write_tokens_bin(out_path: Path, encoded: list[EncodedDoc], dim: int) -> dict:
@@ -49,6 +53,11 @@ def write_tokens_bin(out_path: Path, encoded: list[EncodedDoc], dim: int) -> dic
       doc_offsets[n_docs+1] u64 LE  (CSR)
       token_ids[n_tokens]   u32 LE
       vectors[n_tokens*dim] f32 LE  (row-major, L2-normalised)
+
+    Fast path: if every doc's `vectors` is a numpy.ndarray of dtype float32
+    and shape (n_tok_d, dim), the writer concatenates and emits via
+    `fp.write(arr.tobytes())` instead of struct.pack-per-float. This is
+    ~50-100x faster on large outputs.
     """
     n_docs = len(encoded)
     n_tokens = sum(len(d.token_ids) for d in encoded)
@@ -59,6 +68,22 @@ def write_tokens_bin(out_path: Path, encoded: list[EncodedDoc], dim: int) -> dic
     for d in encoded:
         doc_offsets.append(doc_offsets[-1] + len(d.token_ids))
     assert doc_offsets[-1] == n_tokens
+
+    # Check whether every doc has numpy vectors → bulk-write path.
+    try:
+        import numpy as np  # type: ignore
+        np_ndarray = np.ndarray
+    except ImportError:  # pragma: no cover - numpy is a hard dep in practice
+        np = None
+        np_ndarray = ()
+
+    bulk_ok = np is not None and all(
+        isinstance(d.vectors, np_ndarray)
+        and d.vectors.dtype == np.float32
+        and d.vectors.ndim == 2
+        and d.vectors.shape == (len(d.token_ids), dim)
+        for d in encoded
+    )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("wb") as f:
@@ -71,21 +96,40 @@ def write_tokens_bin(out_path: Path, encoded: list[EncodedDoc], dim: int) -> dic
         f.write(b"\x00" * 7)
         assert f.tell() == HEADER_SIZE
 
-        for o in doc_offsets:
-            f.write(struct.pack("<Q", o))
+        if bulk_ok:
+            offsets_arr = np.asarray(doc_offsets, dtype="<u8")
+            f.write(offsets_arr.tobytes())
 
-        for d in encoded:
-            for tid in d.token_ids:
-                f.write(struct.pack("<I", int(tid)))
+            ids_arr = np.fromiter(
+                (int(tid) for d in encoded for tid in d.token_ids),
+                dtype="<u4",
+                count=n_tokens,
+            )
+            f.write(ids_arr.tobytes())
 
-        for d in encoded:
-            for vec in d.vectors:
-                if len(vec) != dim:
-                    raise SystemExit(
-                        f"internal: doc {d.doc_id!r} vector dim {len(vec)} != {dim}"
-                    )
-                for x in vec:
-                    f.write(struct.pack("<f", float(x)))
+            # Concatenate L2-normalized rows in CSR order; ensure
+            # native-little-endian f32 contiguous bytes.
+            vecs_arr = np.concatenate(
+                [np.ascontiguousarray(d.vectors, dtype="<f4") for d in encoded],
+                axis=0,
+            )
+            f.write(vecs_arr.tobytes())
+        else:
+            for o in doc_offsets:
+                f.write(struct.pack("<Q", o))
+
+            for d in encoded:
+                for tid in d.token_ids:
+                    f.write(struct.pack("<I", int(tid)))
+
+            for d in encoded:
+                for vec in d.vectors:
+                    if len(vec) != dim:
+                        raise SystemExit(
+                            f"internal: doc {d.doc_id!r} vector dim {len(vec)} != {dim}"
+                        )
+                    for x in vec:
+                        f.write(struct.pack("<f", float(x)))
 
     return {"n_docs": n_docs, "n_tokens": n_tokens, "dim": dim}
 
