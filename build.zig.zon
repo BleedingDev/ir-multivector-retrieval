@@ -1,0 +1,13 @@
+.{
+    .name = .tac,
+    .version = "0.0.1",
+    .fingerprint = 0x4e4739a8f35c8c6,
+    .minimum_zig_version = "0.16.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+    },
+    .dependencies = .{},
+}

@@ -1,0 +1,35 @@
+# Zig
+zig-cache/
+zig-out/
+.zig-cache/
+
+# Datasets — fetched, never committed
+data/
+indices/
+*.npy
+*.npz
+*.parquet
+*.tsv
+*.jsonl
+*.bin
+
+# Benchmark output
+benchmarks/results/
+
+# Reference impl checkout (when it lands)
+third_party/
+
+# Python (encoder pipeline)
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Local agent state
+.codex/plan-graphs/
+.local-state/
