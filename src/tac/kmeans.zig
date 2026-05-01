@@ -185,16 +185,11 @@ pub fn fit(
 
         iters_run = iter + 1;
 
-        // ---- Convergence check. ----
-        // Skip on first iter (prev_wcss == inf). Paper §3 does not pin a
-        // tolerance; relative delta is the standard choice.
-        if (iter > 0) {
-            const denom = if (prev_wcss > 0.0) prev_wcss else 1.0;
-            const rel_delta = (prev_wcss - wcss) / denom;
-            if (rel_delta < p.tol) break;
-        }
-
         // ---- Update step. ----
+        // Run BEFORE the convergence check so the returned `centroids` always
+        // reflect `mean(points where assignments == k)` — the centroid-
+        // consistency invariant. The previous order checked convergence
+        // first and broke out with stale centroids from the prior iteration.
         for (0..k) |cc| {
             if (cluster_counts[cc] > 0) {
                 const inv: f32 = 1.0 / @as(f32, @floatFromInt(cluster_counts[cc]));
@@ -214,6 +209,15 @@ pub fn fit(
                 // the same iteration doesn't pick the same point.
                 min_to_any[far_idx] = -std.math.inf(f32);
             }
+        }
+
+        // ---- Convergence check. ----
+        // Skip on first iter (prev_wcss == inf). Paper §3 does not pin a
+        // tolerance; relative delta is the standard choice.
+        if (iter > 0) {
+            const denom = if (prev_wcss > 0.0) prev_wcss else 1.0;
+            const rel_delta = (prev_wcss - wcss) / denom;
+            if (rel_delta < p.tol) break;
         }
 
         prev_wcss = wcss;
@@ -298,6 +302,13 @@ fn assignVectors(
     defer gpa.free(threads);
 
     const chunk: usize = (n + real_threads - 1) / real_threads;
+    // Track how many threads were successfully spawned. On a mid-loop
+    // `std.Thread.spawn` failure we MUST join the already-spawned ones
+    // before propagating the error — otherwise the workers keep running
+    // with references to `ctxs`/`threads` that the deferred frees are
+    // about to release, producing a use-after-free. Mirrors the pattern
+    // in src/index/hnsw.zig:865.
+    var spawned: u32 = 0;
     var t: u32 = 0;
     while (t < real_threads) : (t += 1) {
         const lo: usize = @as(usize, t) * chunk;
@@ -314,10 +325,18 @@ fn assignVectors(
             .gpa = gpa,
             .err_out = null,
         };
-        threads[t] = try std.Thread.spawn(.{}, Runner.run, .{&ctxs[t]});
+        threads[spawned] = std.Thread.spawn(.{}, Runner.run, .{&ctxs[t]}) catch |err| {
+            var j: u32 = 0;
+            while (j < spawned) : (j += 1) threads[j].join();
+            return err;
+        };
+        spawned += 1;
     }
-    for (threads) |th| th.join();
-    for (ctxs) |c| if (c.err_out) |err| return err;
+    {
+        var j: u32 = 0;
+        while (j < spawned) : (j += 1) threads[j].join();
+    }
+    for (ctxs[0..spawned]) |c| if (c.err_out) |err| return err;
 }
 
 /// Per-slice argmin: writes `assignments[i]` and `min_to_any[i]` for

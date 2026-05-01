@@ -168,10 +168,11 @@ def parse_args() -> argparse.Namespace:
         "--sort-by-length",
         action="store_true",
         help=(
-            "sort docs by tokenizer length before batching. Reduces padding "
-            "waste 20-30%% on heterogeneous corpora at the cost of one extra "
-            "tokenize pass. Encoded order is restored at write time so "
-            "doc_id_map / qid_map remain in input order."
+            "sort docs by character length before batching (cheap proxy "
+            "for tokenizer length). Reduces padding waste 20-30%% on "
+            "heterogeneous corpora. Output is slot-filled by original "
+            "input index, so doc_id_map / qid_map and the on-disk doc "
+            "order match the input — matches encode_mlx.py's behavior."
         ),
     )
     p.add_argument(
@@ -282,7 +283,11 @@ def encode_docs(
     if use_fp16:
         model.half()
 
-    encoded: list[EncodedDoc] = []
+    n_input = len(docs)
+    # Slot-keyed output: position i corresponds to the i-th input doc. None
+    # means "not yet encoded or was dropped". Mirrors encode_mlx.py so the
+    # two encoders are interchangeable when --sort-by-length is on.
+    slots: list[EncodedDoc | None] = [None] * n_input
     dropped: list[tuple[str, str]] = []
     dim: int | None = None
 
@@ -306,26 +311,22 @@ def encode_docs(
         except Exception as e:  # noqa: BLE001
             print(f"warmup pass failed (continuing): {e!r}", file=sys.stderr)
 
-    # Optional length-sort: encode docs in tokenizer-length order so each
+    # Optional length-sort: iterate docs in tokenizer-length order so each
     # batch pads to its own longest member rather than the global longest.
-    # Output is restored to input order at the end so the caller's
-    # doc_id_map / qid_map stays meaningful.
-    encode_order: list[int]
-    if sort_by_length:
-        # Use a cheap proxy: character length. The model.tokenize call would
-        # be more accurate but doubles the tokenize cost; char length
-        # correlates well enough on natural text for batch packing.
-        encode_order = sorted(range(len(docs)), key=lambda i: len(docs[i]["text"]))
-        docs = [docs[i] for i in encode_order]
-        print(f"sorted {len(docs)} docs by char length for tighter batches", file=sys.stderr)
+    # The iteration order is `encode_order`; output gets slot-filled by the
+    # original input index at write time.
+    if sort_by_length and n_input > 1:
+        # Cheap proxy: character length. model.tokenize would be more
+        # accurate but doubles the tokenize cost; char length correlates
+        # well enough on natural text for batch packing.
+        encode_order: list[int] = sorted(range(n_input), key=lambda i: len(docs[i]["text"]))
+        print(f"sorted {n_input} docs by char length for tighter batches", file=sys.stderr)
     else:
-        encode_order = list(range(len(docs)))
+        encode_order = list(range(n_input))
 
-    # Track the encoded item's input position; we restore order at the end.
-    sorted_to_input: list[int] = encode_order
-
-    for batch_start in range(0, len(docs), batch_size):
-        batch = docs[batch_start : batch_start + batch_size]
+    for batch_start in range(0, n_input, batch_size):
+        batch_indices = encode_order[batch_start : batch_start + batch_size]
+        batch = [docs[i] for i in batch_indices]
         texts = [d["text"] for d in batch]
         try:
             features = model.tokenize(texts, is_query=is_query)
@@ -369,7 +370,7 @@ def encode_docs(
                 )
             dropped.append((doc_id, reason))
 
-        for b, d in enumerate(batch):
+        for b, (orig_i, d) in enumerate(zip(batch_indices, batch)):
             try:
                 kept_mask = keep[b]
                 kept_ids = input_ids[b][kept_mask].detach().cpu().tolist()
@@ -402,12 +403,10 @@ def encode_docs(
                         f"dim drift: expected {dim}, got {d_dim}",
                     )
                     continue
-                encoded.append(
-                    EncodedDoc(
-                        doc_id=str(d["doc_id"]),
-                        token_ids=[int(x) for x in kept_ids],
-                        vectors=kept_emb.tolist(),
-                    )
+                slots[orig_i] = EncodedDoc(
+                    doc_id=str(d["doc_id"]),
+                    token_ids=[int(x) for x in kept_ids],
+                    vectors=kept_emb.tolist(),
                 )
             except SystemExit:
                 # Fail-fast bubble-up from _record_drop.
@@ -418,24 +417,9 @@ def encode_docs(
     if dim is None:
         raise SystemExit("no docs encoded successfully — aborting before writing")
 
-    # Restore input-order if we sorted. Build a doc_id → encoded slot map
-    # then walk encode_order to materialise the original sequence.
-    if sort_by_length:
-        by_id = {e.doc_id: e for e in encoded}
-        # `sorted_to_input` holds input-side indices in tokenize-batch order;
-        # we want to emit in the original input order. So iterate input
-        # indices 0..N-1, find the doc_id at that input position via the
-        # original `docs` list captured pre-sort isn't visible here — instead
-        # we sort `encoded` by the dict insertion of doc_ids by input index.
-        # Simpler: sort `encoded` by the position of its doc_id in the
-        # *post-sort* order, then invert that permutation.
-        # In practice the cleanest path is: sort `encoded` by an input-order
-        # key. The caller passes input doc IDs separately, so let the caller
-        # restore order if it cares. For now, leave `encoded` in encode order
-        # — the sidecar JSON's doc_id_map then reflects encode order, which
-        # downstream consumers should handle.
-        _ = by_id  # silence unused
-        _ = sorted_to_input
+    # Slots are already in input order; drop None entries (drops were
+    # recorded separately in `dropped`).
+    encoded = [s for s in slots if s is not None]
     return encoded, dropped, dim
 
 
