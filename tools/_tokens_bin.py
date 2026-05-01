@@ -14,9 +14,49 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import os
 import struct
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterator
+
+
+@contextmanager
+def _atomic_write(
+    final_path: Path,
+    mode: str,
+    *,
+    encoding: str | None = None,
+) -> Iterator:
+    """Yield a file handle for `<final_path>.tmp`; fsync + atomic-rename on success.
+
+    Writes go to a temp file in the same directory (POSIX rename is atomic
+    across the same filesystem). On clean exit we flush, fsync the file,
+    close it, then `os.replace` it onto `final_path`. The fsync ensures
+    bytes are durable before rename, so a crash post-rename leaves a valid
+    file rather than a renamed-but-empty inode. On any exception the temp
+    file is removed and the original (if any) is left untouched.
+    """
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = final_path.with_name(final_path.name + ".tmp")
+    f = tmp_path.open(mode, encoding=encoding)
+    try:
+        yield f
+        f.flush()
+        os.fsync(f.fileno())
+        f.close()
+        os.replace(tmp_path, final_path)
+    except BaseException:
+        try:
+            f.close()
+        except Exception:
+            pass
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
+        raise
 
 # Keep these in lockstep with src/io/token_dump.zig + src/constants.zig.
 TOKEN_DUMP_MAGIC = b"TAC_TKN1"
@@ -85,8 +125,7 @@ def write_tokens_bin(out_path: Path, encoded: list[EncodedDoc], dim: int) -> dic
         for d in encoded
     )
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with out_path.open("wb") as f:
+    with _atomic_write(out_path, "wb") as f:
         f.write(TOKEN_DUMP_MAGIC)
         f.write(struct.pack("<I", TOKEN_DUMP_VERSION))
         f.write(struct.pack("<I", dim))
@@ -138,8 +177,7 @@ def write_qids_sidecar(qids_path: Path, qid_strings: list[str]) -> None:
     """Flat little-endian u32 array, one entry per encoded query in CSR row
     order. The Zig bench harness mmaps it as `[]const u32` directly. qids
     must be integer-parseable (MS MARCO + LoTTE qualify)."""
-    qids_path.parent.mkdir(parents=True, exist_ok=True)
-    with qids_path.open("wb") as f:
+    with _atomic_write(qids_path, "wb") as f:
         for q in qid_strings:
             try:
                 qi = int(q)
@@ -205,7 +243,6 @@ def write_metadata(
         "source_jsonl": str(docs_jsonl),
         "notes": notes,
     }
-    meta_path.parent.mkdir(parents=True, exist_ok=True)
-    with meta_path.open("w", encoding="utf-8") as f:
+    with _atomic_write(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2, ensure_ascii=False)
         f.write("\n")
