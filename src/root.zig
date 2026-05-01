@@ -35,6 +35,7 @@ pub const retrieval = struct {
     pub const gather = @import("retrieval/gather.zig");
     pub const prune = @import("retrieval/prune.zig");
     pub const refine = @import("retrieval/refine.zig");
+    pub const search = @import("retrieval/search.zig");
 };
 
 pub const eval = struct {
