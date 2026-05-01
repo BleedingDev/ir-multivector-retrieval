@@ -174,6 +174,27 @@ def parse_args() -> argparse.Namespace:
             "doc_id_map / qid_map remain in input order."
         ),
     )
+    p.add_argument(
+        "--allow-drops",
+        action="store_true",
+        help=(
+            "opt into lenient encode: continue past per-doc / per-batch "
+            "encode failures instead of failing the whole run. Default is "
+            "fail-fast on any drop so service-style invocations don't "
+            "silently shrink the corpus. Combine with --max-drop-rate to "
+            "still bound the damage."
+        ),
+    )
+    p.add_argument(
+        "--max-drop-rate",
+        type=float,
+        default=0.0,
+        help=(
+            "max fraction of docs (in [0,1]) allowed to drop when "
+            "--allow-drops is set. Defaults to 0.0 (any drop fails). "
+            "Ignored unless --allow-drops is passed."
+        ),
+    )
     return p.parse_args()
 
 
@@ -217,6 +238,7 @@ def encode_docs(
     trust_remote_code: bool,
     sort_by_length: bool = False,
     use_fp16: bool = False,
+    allow_drops: bool = False,
 ) -> tuple[list[EncodedDoc], list[tuple[str, str]], int]:
     """Returns (encoded, dropped, dim).
 
@@ -328,9 +350,24 @@ def encode_docs(
                 ).bool()
                 keep = skip & attn
         except Exception as e:  # noqa: BLE001
+            if not allow_drops:
+                ids = ", ".join(str(d["doc_id"]) for d in batch[:5])
+                more = f" (+{len(batch) - 5} more)" if len(batch) > 5 else ""
+                raise SystemExit(
+                    f"batch encode failed (fail-fast; pass --allow-drops to "
+                    f"convert into recorded drops): docs=[{ids}{more}] err={e!r}"
+                ) from e
             for d in batch:
                 dropped.append((str(d["doc_id"]), f"batch encode failed: {e!r}"))
             continue
+
+        def _record_drop(doc_id: str, reason: str) -> None:
+            if not allow_drops:
+                raise SystemExit(
+                    f"doc {doc_id!r} would be dropped (fail-fast; pass "
+                    f"--allow-drops to allow): {reason}"
+                )
+            dropped.append((doc_id, reason))
 
         for b, d in enumerate(batch):
             try:
@@ -342,35 +379,27 @@ def encode_docs(
                 kept_emb = torch.nn.functional.normalize(kept_emb, p=2, dim=1)
 
                 if kept_emb.dim() != 2:
-                    dropped.append(
-                        (str(d["doc_id"]), f"unexpected encoder shape {tuple(kept_emb.shape)}")
-                    )
+                    _record_drop(str(d["doc_id"]), f"unexpected encoder shape {tuple(kept_emb.shape)}")
                     continue
                 n_tok, d_dim = int(kept_emb.shape[0]), int(kept_emb.shape[1])
                 if d_dim == 0 or d_dim > MAX_DIM:
-                    dropped.append(
-                        (str(d["doc_id"]), f"dim {d_dim} outside [1, {MAX_DIM}]")
-                    )
+                    _record_drop(str(d["doc_id"]), f"dim {d_dim} outside [1, {MAX_DIM}]")
                     continue
                 if n_tok == 0:
-                    dropped.append((str(d["doc_id"]), "0-token output after masking"))
+                    _record_drop(str(d["doc_id"]), "0-token output after masking")
                     continue
                 if len(kept_ids) != n_tok:
-                    dropped.append(
-                        (
-                            str(d["doc_id"]),
-                            f"id/embedding length mismatch: {len(kept_ids)} != {n_tok}",
-                        )
+                    _record_drop(
+                        str(d["doc_id"]),
+                        f"id/embedding length mismatch: {len(kept_ids)} != {n_tok}",
                     )
                     continue
                 if dim is None:
                     dim = d_dim
                 elif dim != d_dim:
-                    dropped.append(
-                        (
-                            str(d["doc_id"]),
-                            f"dim drift: expected {dim}, got {d_dim}",
-                        )
+                    _record_drop(
+                        str(d["doc_id"]),
+                        f"dim drift: expected {dim}, got {d_dim}",
                     )
                     continue
                 encoded.append(
@@ -380,8 +409,11 @@ def encode_docs(
                         vectors=kept_emb.tolist(),
                     )
                 )
+            except SystemExit:
+                # Fail-fast bubble-up from _record_drop.
+                raise
             except Exception as e:  # noqa: BLE001
-                dropped.append((str(d["doc_id"]), f"post-process failed: {e!r}"))
+                _record_drop(str(d["doc_id"]), f"post-process failed: {e!r}")
 
     if dim is None:
         raise SystemExit("no docs encoded successfully — aborting before writing")
@@ -462,6 +494,11 @@ def main() -> None:
     else:
         encoder_batch = args.batch
 
+    if args.max_drop_rate < 0.0 or args.max_drop_rate > 1.0:
+        raise SystemExit(
+            f"--max-drop-rate must be in [0.0, 1.0], got {args.max_drop_rate}"
+        )
+
     encoded, dropped, dim = encode_docs(
         docs,
         mode=args.mode,
@@ -471,11 +508,27 @@ def main() -> None:
         trust_remote_code=args.trust_remote_code,
         sort_by_length=args.sort_by_length,
         use_fp16=use_fp16,
+        allow_drops=args.allow_drops,
     )
     print(
         f"encoded {len(encoded)} {noun} (dim={dim}, dropped={len(dropped)})",
         file=sys.stderr,
     )
+
+    # Bound drops even when --allow-drops is on. With drops==0 (the default
+    # fail-fast path) this is a no-op; with drops>0 it enforces the user's
+    # ceiling so a 50% silent corpus shrink can't slip past unnoticed.
+    if args.allow_drops and dropped:
+        n_input = len(docs)
+        rate = len(dropped) / n_input if n_input else 0.0
+        if rate > args.max_drop_rate:
+            sample = ", ".join(f"{did}:{r}" for did, r in dropped[:3])
+            more = f" (+{len(dropped) - 3} more)" if len(dropped) > 3 else ""
+            raise SystemExit(
+                f"drop rate {rate:.4f} exceeds --max-drop-rate "
+                f"{args.max_drop_rate:.4f} ({len(dropped)}/{n_input} docs); "
+                f"first failures: [{sample}{more}]"
+            )
 
     stats = write_tokens_bin(args.out, encoded, dim)
     print(

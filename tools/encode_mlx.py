@@ -112,6 +112,27 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="sidecar metadata path; defaults to <out>.meta.json",
     )
+    p.add_argument(
+        "--allow-drops",
+        action="store_true",
+        help=(
+            "opt into lenient encode: continue past per-doc / per-batch "
+            "encode failures instead of failing the whole run. Default is "
+            "fail-fast on any drop so service-style invocations don't "
+            "silently shrink the corpus. Combine with --max-drop-rate to "
+            "still bound the damage."
+        ),
+    )
+    p.add_argument(
+        "--max-drop-rate",
+        type=float,
+        default=0.0,
+        help=(
+            "max fraction of docs (in [0,1]) allowed to drop when "
+            "--allow-drops is set. Defaults to 0.0 (any drop fails). "
+            "Ignored unless --allow-drops is passed."
+        ),
+    )
     return p.parse_args()
 
 
@@ -361,6 +382,7 @@ def encode_docs_mlx(
     batch_size: int,
     trust_remote_code: bool,
     sort_by_length: bool = False,
+    allow_drops: bool = False,
 ) -> tuple[list[EncodedDoc], list[tuple[str, str]], int]:
     """Encode docs through MLX. Returns (encoded, dropped, dim).
 
@@ -470,6 +492,13 @@ def encode_docs_mlx(
             # Force evaluation so we have concrete arrays for slicing.
             mx.eval(tok_emb)
         except Exception as e:  # noqa: BLE001
+            if not allow_drops:
+                ids = ", ".join(str(d["doc_id"]) for d in batch[:5])
+                more = f" (+{len(batch) - 5} more)" if len(batch) > 5 else ""
+                raise SystemExit(
+                    f"batch encode failed (fail-fast; pass --allow-drops to "
+                    f"convert into recorded drops): docs=[{ids}{more}] err={e!r}"
+                ) from e
             for d in batch:
                 dropped.append((str(d["doc_id"]), f"batch encode failed: {e!r}"))
             continue
@@ -489,6 +518,11 @@ def encode_docs_mlx(
             try:
                 row_keep = keep_mask[b]
                 if not row_keep.any():
+                    if not allow_drops:
+                        raise SystemExit(
+                            f"doc {d['doc_id']!r} would be dropped (fail-fast; "
+                            f"pass --allow-drops): 0-token output after masking"
+                        )
                     dropped.append((str(d["doc_id"]), "0-token output after masking"))
                     continue
                 kept_ids = ids_np[b][row_keep].astype(int).tolist()
@@ -500,7 +534,14 @@ def encode_docs_mlx(
                     token_ids=kept_ids,
                     vectors=kept_vecs,
                 )
+            except SystemExit:
+                raise
             except Exception as e:  # noqa: BLE001
+                if not allow_drops:
+                    raise SystemExit(
+                        f"doc {d['doc_id']!r} post-process failed (fail-fast; "
+                        f"pass --allow-drops): {e!r}"
+                    ) from e
                 dropped.append((str(d["doc_id"]), f"post-process failed: {e!r}"))
 
     encoded = [s for s in slots if s is not None]
@@ -533,6 +574,11 @@ def main() -> None:
         # amortize fixed kernel/dispatch cost on Apple Silicon.
         batch_size = 128 if args.dtype == "fp16" else 64
 
+    if args.max_drop_rate < 0.0 or args.max_drop_rate > 1.0:
+        raise SystemExit(
+            f"--max-drop-rate must be in [0.0, 1.0], got {args.max_drop_rate}"
+        )
+
     encoded, dropped, dim = encode_docs_mlx(
         docs,
         model_name=args.model,
@@ -541,11 +587,26 @@ def main() -> None:
         batch_size=batch_size,
         trust_remote_code=args.trust_remote_code,
         sort_by_length=args.sort_by_length,
+        allow_drops=args.allow_drops,
     )
     print(
         f"encoded {len(encoded)} docs (dim={dim}, dropped={len(dropped)})",
         file=sys.stderr,
     )
+
+    # Bound drops even when --allow-drops is on (no-op when 0). Symmetric
+    # with encode.py.
+    if args.allow_drops and dropped:
+        n_input = len(docs)
+        rate = len(dropped) / n_input if n_input else 0.0
+        if rate > args.max_drop_rate:
+            sample = ", ".join(f"{did}:{r}" for did, r in dropped[:3])
+            more = f" (+{len(dropped) - 3} more)" if len(dropped) > 3 else ""
+            raise SystemExit(
+                f"drop rate {rate:.4f} exceeds --max-drop-rate "
+                f"{args.max_drop_rate:.4f} ({len(dropped)}/{n_input} docs); "
+                f"first failures: [{sample}{more}]"
+            )
 
     stats = write_tokens_bin(args.out, encoded, dim)
     print(
