@@ -25,6 +25,9 @@ __pycache__/
 .venv/
 *.egg-info/
 
+# MLX weight cache (export_colbert_to_mlx.py output, ~400 MB per model)
+tools/.cache/
+
 # IDE / OS
 .idea/
 .vscode/
