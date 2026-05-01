@@ -389,12 +389,241 @@ pub fn allocateBudgets(
 }
 
 // ---------------------------------------------------------------------------
-// Public driver — gated on TokenDump (#4).
+// Public driver — TAC.cluster end-to-end.
 // ---------------------------------------------------------------------------
 
-// pub fn cluster(...) — implementation lands once io/token_dump.zig exposes
-// TokenDump and synthetic.zig gives us a fixture builder. See header for
-// full pseudocode. Internal phase logic above is fully testable today.
+const token_dump = @import("../io/token_dump.zig");
+
+pub const ClusteringResult = struct {
+    /// `kappa_total · dim`, concatenated in token-id order.
+    centroids: []f32,
+    /// Length `n_tokens` — global centroid id for input vector `i`, in `[0, kappa_total)`.
+    assignments: []u32,
+    /// Length `n_distinct_tokens` — Σ == kappa_total.
+    kappa_per_token: []u32,
+    /// Σ_j WCSS_j across all tokens (regression metric for #10).
+    wcss_total: f32,
+
+    pub fn deinit(self: *ClusteringResult, gpa: Allocator) void {
+        gpa.free(self.centroids);
+        gpa.free(self.assignments);
+        gpa.free(self.kappa_per_token);
+        self.* = undefined;
+    }
+};
+
+/// Cluster a TokenDump corpus using TAC (paper §3 four-phase pipeline).
+/// Thin wrapper over `clusterFlat`; the flat form is the testable contract.
+pub fn cluster(
+    td: token_dump.TokenDump,
+    p: ClusteringParams,
+    gpa: Allocator,
+) ClusteringError!ClusteringResult {
+    return clusterFlat(td.token_ids, td.vectors, td.dim, p, gpa);
+}
+
+/// Cluster a corpus of token vectors using TAC (paper §3 four-phase pipeline).
+///
+/// Inputs:
+///   - `token_ids[i]`: vocabulary id of the i-th vector. Vocabulary size N_T
+///     is inferred as max(token_ids)+1.
+///   - `vectors[i*dim..(i+1)*dim]`: the i-th token vector.
+///   - `p.kappa_total`: global centroid budget κ.
+///
+/// Output (caller-owned via `ClusteringResult.deinit`):
+///   - `centroids`:        kappa_total · dim, concatenated in token-id order
+///   - `assignments[i]`:   global centroid id for input vector i (in 0..κ)
+///   - `kappa_per_token[j]`: κ_j; Σ == kappa_total
+///   - `wcss_total`:       Σ_j WCSS_j over all tokens (regression metric)
+///
+/// paper §3.3 phase order: Phase 1+2+3+4 produce κ_j, then per-token Lloyd
+/// produces centroids. Per-token determinism: seed = p.seed XOR token_id.
+pub fn clusterFlat(
+    token_ids: []const u32,
+    vectors: []const f32,
+    dim: u32,
+    p: ClusteringParams,
+    gpa: Allocator,
+) ClusteringError!ClusteringResult {
+    if (token_ids.len == 0) return error.EmptyTokenDump;
+    if (dim == 0) return error.InvalidThresholds;
+    if (vectors.len != token_ids.len * @as(usize, dim)) return error.InvalidThresholds;
+    if (p.kappa_total == 0) return error.BudgetTooSmall;
+
+    // ---- Step 0: vocabulary size + per-token frequencies. ----
+    var max_id: u32 = 0;
+    for (token_ids) |t| {
+        if (t > max_id) max_id = t;
+    }
+    const n_distinct: usize = @as(usize, max_id) + 1;
+
+    const freqs = try gpa.alloc(u32, n_distinct);
+    defer gpa.free(freqs);
+    @memset(freqs, 0);
+    for (token_ids) |t| freqs[t] += 1;
+
+    // ---- Step 1: CSR-grouping of input indices by token id. ----
+    const group_offsets = try gpa.alloc(u32, n_distinct + 1);
+    defer gpa.free(group_offsets);
+    group_offsets[0] = 0;
+    for (0..n_distinct) |j| group_offsets[j + 1] = group_offsets[j] + freqs[j];
+
+    const group_indices = try gpa.alloc(u32, token_ids.len);
+    defer gpa.free(group_indices);
+    {
+        const cursor = try gpa.alloc(u32, n_distinct);
+        defer gpa.free(cursor);
+        @memcpy(cursor, group_offsets[0..n_distinct]);
+        for (token_ids, 0..) |t, i| {
+            group_indices[cursor[t]] = @intCast(i);
+            cursor[t] += 1;
+        }
+    }
+
+    // ---- Step 2: per-token spread s_j (paper §3.2) via Welford's algorithm.
+    // Welford gives a numerically stable streaming variance; mathematically
+    // equivalent to the paper's `s_j = (1/n_j)·Σ‖t_{j,i} - t̄_j‖²`. We
+    // accumulate component-wise M2 then sum to get the trace-of-covariance.
+    const spreads = try gpa.alloc(f32, n_distinct);
+    defer gpa.free(spreads);
+    @memset(spreads, 0.0);
+
+    {
+        const mean_buf = try gpa.alloc(f32, dim);
+        defer gpa.free(mean_buf);
+        const m2_buf = try gpa.alloc(f32, dim);
+        defer gpa.free(m2_buf);
+
+        for (0..n_distinct) |j| {
+            const start = group_offsets[j];
+            const end = group_offsets[j + 1];
+            const n_j = end - start;
+            if (n_j == 0) continue;
+            @memset(mean_buf, 0.0);
+            @memset(m2_buf, 0.0);
+            var count: f32 = 0.0;
+            var idx_i: u32 = start;
+            while (idx_i < end) : (idx_i += 1) {
+                const v = vectors[group_indices[idx_i] * @as(usize, dim) ..][0..dim];
+                count += 1.0;
+                const inv_count: f32 = 1.0 / count;
+                for (0..dim) |dd| {
+                    const x = v[dd];
+                    const old_mean = mean_buf[dd];
+                    const delta = x - old_mean;
+                    mean_buf[dd] = old_mean + delta * inv_count;
+                    m2_buf[dd] += delta * (x - mean_buf[dd]);
+                }
+            }
+            var trace: f32 = 0.0;
+            for (m2_buf) |m| trace += m;
+            spreads[j] = trace / @as(f32, @floatFromInt(n_j));
+        }
+    }
+
+    // ---- Step 3: phases 1+2+3+4 produce κ_j per token. ----
+    const kappa_per_token = try gpa.alloc(u32, n_distinct);
+    errdefer gpa.free(kappa_per_token);
+    const frac = try gpa.alloc(f32, n_distinct);
+    defer gpa.free(frac);
+
+    try allocateBudgets(freqs, spreads, kappa_per_token, frac, p.kappa_total, p);
+
+    // Post-condition: any token with freq > 0 must have κ_j ≥ 1, otherwise
+    // we'd be unable to assign its vectors to any centroid. Phase 4's deficit
+    // fallback can degrade micro tokens to κ_j=0; surface that as
+    // `error.BudgetTooSmall` (paper-gap) rather than ship corrupt assignments.
+    for (freqs, kappa_per_token) |n_j, k_j| {
+        if (n_j > 0 and k_j == 0) return error.BudgetTooSmall;
+    }
+
+    // ---- Step 4: per-token Lloyd's, gathering each token's vectors. ----
+    const global_offsets = try gpa.alloc(u32, n_distinct + 1);
+    defer gpa.free(global_offsets);
+    global_offsets[0] = 0;
+    for (0..n_distinct) |j| global_offsets[j + 1] = global_offsets[j] + kappa_per_token[j];
+
+    const total_centroids = global_offsets[n_distinct];
+    if (total_centroids != p.kappa_total) {
+        return error.BudgetTooSmall;
+    }
+
+    const centroids = try gpa.alloc(f32, @as(usize, total_centroids) * dim);
+    errdefer gpa.free(centroids);
+    const assignments = try gpa.alloc(u32, token_ids.len);
+    errdefer gpa.free(assignments);
+
+    var max_n_j: u32 = 0;
+    for (freqs) |n_j| {
+        if (n_j > max_n_j) max_n_j = n_j;
+    }
+    const gather = try gpa.alloc(f32, @as(usize, max_n_j) * dim);
+    defer gpa.free(gather);
+
+    var wcss_total: f32 = 0.0;
+
+    for (0..n_distinct) |j| {
+        const k_j = kappa_per_token[j];
+        if (k_j == 0) continue;
+        const start = group_offsets[j];
+        const end = group_offsets[j + 1];
+        const n_j = end - start;
+        if (n_j == 0) continue;
+
+        // Materialise this token's vectors contiguously.
+        var w: usize = 0;
+        var idx_i: u32 = start;
+        while (idx_i < end) : (idx_i += 1) {
+            const src_idx: usize = group_indices[idx_i];
+            @memcpy(
+                gather[w * @as(usize, dim) ..][0..dim],
+                vectors[src_idx * @as(usize, dim) ..][0..dim],
+            );
+            w += 1;
+        }
+
+        var res = try kmeans.fit(
+            gather[0 .. @as(usize, n_j) * dim],
+            dim,
+            .{
+                .k = k_j,
+                .max_iters = p.max_iters,
+                .tol = p.tol,
+                .seed = p.seed ^ @as(u64, j),
+            },
+            gpa,
+        );
+        defer res.deinit(gpa);
+
+        const global_off = global_offsets[j];
+        @memcpy(
+            centroids[@as(usize, global_off) * dim ..][0 .. @as(usize, k_j) * dim],
+            res.centroids[0 .. @as(usize, k_j) * dim],
+        );
+
+        w = 0;
+        idx_i = start;
+        while (idx_i < end) : (idx_i += 1) {
+            const src_idx: usize = group_indices[idx_i];
+            assignments[src_idx] = global_off + res.assignments[w];
+            w += 1;
+        }
+
+        wcss_total += res.wcss;
+    }
+
+    // Final invariant: every assignment is a valid centroid id.
+    for (assignments) |a| {
+        if (a >= total_centroids) return error.InvalidThresholds;
+    }
+
+    return .{
+        .centroids = centroids,
+        .assignments = assignments,
+        .kappa_per_token = kappa_per_token,
+        .wcss_total = wcss_total,
+    };
+}
 
 // ---------------------------------------------------------------------------
 // Tests — phases 1–4 with hand-checkable inputs.
@@ -683,12 +912,263 @@ test "allocateBudgets: deterministic — same inputs land identical kappa" {
     try testing.expectEqualSlices(u32, &kappa1, &kappa2);
 }
 
-test "placeholder — cluster() driver blocked on TokenDump (#4)" {
-    // Keeping a sanity reference to constants so they don't get DCE'd if no
-    // other test touches them.
-    _ = constants.TAC_MU;
-    _ = constants.TAC_TAU;
-    _ = constants.TAC_EPSILON;
-    _ = constants.TAC_THETA;
-    try testing.expect(true);
+// ---------------------------------------------------------------------------
+// clusterFlat — end-to-end driver tests.
+// ---------------------------------------------------------------------------
+
+test "clusterFlat: tiny corpus invariants (Σκ_j == κ, all assignments valid)" {
+    // 4-token vocab, 2-dim, 30 vectors. mu=3, tau=5, eps=1, theta=1.
+    // eps=1 keeps the floor non-binding so we exercise damped allocation
+    // proper. theta=1 keeps the cap non-binding (cap = n_j).
+    // Token 0: 10 vectors around (1, 0). active.
+    // Token 1: 10 vectors around (0, 1). active.
+    // Token 2: 6  vectors around (-1, 0). active.
+    // Token 3: 4  vectors around (0, -1). small (3 ≤ 4 < 5).
+    const allocator = testing.allocator;
+
+    var token_ids: [30]u32 = undefined;
+    var vectors: [60]f32 = undefined; // 30 × 2
+
+    const counts = [_]u32{ 10, 10, 6, 4 };
+    const themes = [_][2]f32{ .{ 1, 0 }, .{ 0, 1 }, .{ -1, 0 }, .{ 0, -1 } };
+    var i: usize = 0;
+    var prng = std.Random.DefaultPrng.init(7);
+    for (counts, 0..) |c, tid| {
+        var k: u32 = 0;
+        while (k < c) : (k += 1) {
+            token_ids[i] = @intCast(tid);
+            vectors[i * 2 + 0] = themes[tid][0] + (prng.random().floatNorm(f32) * 0.05);
+            vectors[i * 2 + 1] = themes[tid][1] + (prng.random().floatNorm(f32) * 0.05);
+            i += 1;
+        }
+    }
+
+    const p = ClusteringParams{
+        .kappa_total = 14,
+        .mu = 3,
+        .tau = 5,
+        .epsilon = 1,
+        .theta = 1,
+        .seed = 42,
+    };
+    var res = try clusterFlat(&token_ids, &vectors, 2, p, allocator);
+    defer res.deinit(allocator);
+
+    var sum: u32 = 0;
+    for (res.kappa_per_token) |k| sum += k;
+    try testing.expectEqual(@as(u32, 14), sum);
+
+    // Token 3 is small: gets exactly κ=2.
+    try testing.expectEqual(@as(u32, 2), res.kappa_per_token[3]);
+
+    for (res.assignments) |a| try testing.expect(a < 14);
+    try testing.expectEqual(@as(usize, 30), res.assignments.len);
+    try testing.expectEqual(@as(usize, 14 * 2), res.centroids.len);
+
+    try testing.expect(std.math.isFinite(res.wcss_total));
+    try testing.expect(res.wcss_total >= 0.0);
+}
+
+test "clusterFlat: deterministic — same inputs produce identical centroids" {
+    const allocator = testing.allocator;
+
+    // 5 active tokens of n=8 each; epsilon=1 keeps the floor light so a
+    // smallish kappa_total is still achievable.
+    var token_ids: [40]u32 = undefined;
+    var vectors: [120]f32 = undefined; // 40 × 3
+    var prng = std.Random.DefaultPrng.init(1);
+    for (0..40) |idx| {
+        token_ids[idx] = @intCast(idx % 5);
+        vectors[idx * 3 + 0] = prng.random().floatNorm(f32);
+        vectors[idx * 3 + 1] = prng.random().floatNorm(f32);
+        vectors[idx * 3 + 2] = prng.random().floatNorm(f32);
+    }
+
+    const p = ClusteringParams{
+        .kappa_total = 18,
+        .mu = 3,
+        .tau = 5,
+        .epsilon = 1,
+        .theta = 1,
+        .seed = 12345,
+    };
+    var r1 = try clusterFlat(&token_ids, &vectors, 3, p, allocator);
+    defer r1.deinit(allocator);
+    var r2 = try clusterFlat(&token_ids, &vectors, 3, p, allocator);
+    defer r2.deinit(allocator);
+
+    try testing.expectEqualSlices(f32, r1.centroids, r2.centroids);
+    try testing.expectEqualSlices(u32, r1.assignments, r2.assignments);
+    try testing.expectEqualSlices(u32, r1.kappa_per_token, r2.kappa_per_token);
+    try testing.expectEqual(r1.wcss_total, r2.wcss_total);
+}
+
+test "clusterFlat: token 0 absent → kappa_per_token[0] == 0" {
+    const allocator = testing.allocator;
+
+    var token_ids = [_]u32{ 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3 };
+    var vectors = [_]f32{ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2 };
+
+    const p = ClusteringParams{
+        .kappa_total = 6,
+        .mu = 3,
+        .tau = 5,
+        .epsilon = 1,
+        .theta = 1,
+        .seed = 0,
+    };
+    var res = try clusterFlat(&token_ids, &vectors, 1, p, allocator);
+    defer res.deinit(allocator);
+
+    // Each present token (n=4) is small (3 ≤ 4 < 5), each gets κ=2.
+    try testing.expectEqualSlices(u32, &.{ 0, 2, 2, 2 }, res.kappa_per_token);
+}
+
+test "clusterFlat: empty input rejected" {
+    const allocator = testing.allocator;
+    const ids = [_]u32{};
+    const v = [_]f32{};
+    const p = ClusteringParams{ .kappa_total = 1, .seed = 0 };
+    try testing.expectError(error.EmptyTokenDump, clusterFlat(&ids, &v, 2, p, allocator));
+}
+
+test "clusterFlat: kappa_total == 0 rejected" {
+    const allocator = testing.allocator;
+    const ids = [_]u32{ 0, 0 };
+    const v = [_]f32{ 1, 0, 0, 1 };
+    const p = ClusteringParams{ .kappa_total = 0, .seed = 0 };
+    try testing.expectError(error.BudgetTooSmall, clusterFlat(&ids, &v, 2, p, allocator));
+}
+
+test "clusterFlat: vector/token-id length mismatch rejected" {
+    const allocator = testing.allocator;
+    const ids = [_]u32{ 0, 0, 0 };
+    const v = [_]f32{ 1, 0, 0, 1 };
+    const p = ClusteringParams{ .kappa_total = 4, .seed = 0 };
+    try testing.expectError(error.InvalidThresholds, clusterFlat(&ids, &v, 2, p, allocator));
+}
+
+test "clusterFlat: centroids land near each token's theme (κ_j == 1 each)" {
+    // 3 tokens, each gets exactly 1 centroid, each clusters tightly around
+    // a far-apart theme. Recovered centroid must land near theme.
+    const allocator = testing.allocator;
+
+    var token_ids: [18]u32 = undefined;
+    var vectors: [36]f32 = undefined;
+    const themes = [_][2]f32{ .{ 10, 0 }, .{ 0, 10 }, .{ -10, 0 } };
+    var prng = std.Random.DefaultPrng.init(99);
+    var i: usize = 0;
+    for (themes, 0..) |t, tid| {
+        var k: u32 = 0;
+        while (k < 6) : (k += 1) {
+            token_ids[i] = @intCast(tid);
+            vectors[i * 2 + 0] = t[0] + (prng.random().floatNorm(f32) * 0.05);
+            vectors[i * 2 + 1] = t[1] + (prng.random().floatNorm(f32) * 0.05);
+            i += 1;
+        }
+    }
+
+    const p = ClusteringParams{
+        .kappa_total = 3,
+        .mu = 2,
+        .tau = 5,
+        .epsilon = 1,
+        .theta = 1,
+        .seed = 0,
+    };
+    var res = try clusterFlat(&token_ids, &vectors, 2, p, allocator);
+    defer res.deinit(allocator);
+
+    try testing.expectEqualSlices(u32, &.{ 1, 1, 1 }, res.kappa_per_token);
+
+    for (themes, 0..) |t, j| {
+        const cx = res.centroids[j * 2 + 0];
+        const cy = res.centroids[j * 2 + 1];
+        try testing.expectApproxEqAbs(t[0], cx, 0.1);
+        try testing.expectApproxEqAbs(t[1], cy, 0.1);
+    }
+
+    for (token_ids, res.assignments) |tid, a| {
+        try testing.expectEqual(@as(u32, tid), a);
+    }
+}
+
+test "cluster: TokenDump wrapper produces same result as clusterFlat" {
+    // Build a TokenDump in-memory and confirm cluster(td, ...) matches
+    // clusterFlat(td.token_ids, td.vectors, ...).
+    const allocator = testing.allocator;
+
+    var token_ids = [_]u32{ 0, 1, 0, 1, 2, 2, 2, 2 };
+    var vectors = [_]f32{
+        1.0, 0.0,
+        0.0, 1.0,
+        0.9, 0.1,
+        0.1, 0.9,
+        -1.0, 0.0,
+        -0.9, 0.1,
+        -1.0, -0.05,
+        -0.95, 0.0,
+    };
+    const offsets = [_]u64{ 0, 4, 8 };
+    const td = token_dump.TokenDump{
+        .dim = 2,
+        .n_docs = 2,
+        .n_tokens = 8,
+        .doc_offsets = &offsets,
+        .token_ids = &token_ids,
+        .vectors = &vectors,
+    };
+
+    const p = ClusteringParams{
+        .kappa_total = 4,
+        .mu = 2,
+        .tau = 4,
+        .epsilon = 1,
+        .theta = 1,
+        .seed = 7,
+    };
+    var via_td = try cluster(td, p, allocator);
+    defer via_td.deinit(allocator);
+    var via_flat = try clusterFlat(&token_ids, &vectors, 2, p, allocator);
+    defer via_flat.deinit(allocator);
+
+    try testing.expectEqualSlices(f32, via_flat.centroids, via_td.centroids);
+    try testing.expectEqualSlices(u32, via_flat.assignments, via_td.assignments);
+    try testing.expectEqualSlices(u32, via_flat.kappa_per_token, via_td.kappa_per_token);
+}
+
+test "cluster: integration with synthetic_fixture (paper-style Zipf vocab)" {
+    // Use the primitives-engineer fixture: deterministic Zipfian token-freq
+    // distribution with per-token themes. Verify TAC ships valid
+    // ClusteringResult on a paper-scale-mini input.
+    const allocator = testing.allocator;
+    const synthetic = @import("../io/synthetic_fixture.zig");
+
+    var fx = try synthetic.build(allocator, .{
+        .seed = 2026,
+        .n_docs = 50,
+        .dim = 8,
+        .vocab_size = 16,
+        .avg_doc_len = 8,
+    });
+    defer fx.deinit(allocator);
+
+    // Paper-scale-mini thresholds: most tokens will be small/active given
+    // n_docs=50 × avg_len=8 = ~400 tokens spread over 16 vocab ids ≈ 25/token.
+    const p = ClusteringParams{
+        .kappa_total = 64,
+        .mu = 5,
+        .tau = 10,
+        .epsilon = 1,
+        .theta = 1,
+        .seed = 0,
+    };
+    var res = try clusterFlat(fx.token_ids, fx.vectors, fx.dim, p, allocator);
+    defer res.deinit(allocator);
+
+    var sum: u32 = 0;
+    for (res.kappa_per_token) |k| sum += k;
+    try testing.expectEqual(@as(u32, 64), sum);
+    for (res.assignments) |a| try testing.expect(a < 64);
+    try testing.expect(std.math.isFinite(res.wcss_total));
 }
