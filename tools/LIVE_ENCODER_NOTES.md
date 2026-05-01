@@ -252,23 +252,46 @@ parity testing is opt-in via the `--mlx-parity` flag.
 
 ### Parity gate results (100-doc fixture)
 
+5 gates total — gate 2 strengthened with an absolute-error check
+(post-audit) and gate 5 added (search-ranking top-k overlap on
+self-queries). See `tests/live/mlx_parity.py::gate2_cosine` /
+`gate5_search_ranking` for definitions.
+
 PyTorch fp32 CPU baseline vs MLX fp32:
 
 | gate | result |
 |---|---|
 | 1. token-id byte equality                  | PASS — 1592 ids match exactly |
-| 2. cosine ≥ 0.998 mean (≥ 0.99 min)        | PASS — mean 0.999998, min 0.999923, p1 0.999991 |
+| 2. cosine ≥ 0.998 mean / ≥ 0.99 min + max\_abs ≤ 1e-2 | PASS — mean 0.999998, min 0.999897, max\_abs 3.50e-3 |
 | 3. two-run MLX determinism                 | PASS — 203776 floats BYTE-IDENTICAL |
-| 4. downstream TAC cluster overlap          | PASS — kappa=92 centroid cosine mean 0.999999, min 0.999997 |
+| 4. downstream TAC cluster overlap          | PASS — kappa=92 centroid cosine mean 0.999999, min 0.999998 |
+| 5. search-ranking top-10 overlap (10 self-queries) | PASS — avg 0.980, min 0.900 (at floor) |
 
 PyTorch fp32 CPU baseline vs MLX **fp16**:
 
 | gate | result |
 |---|---|
 | 1. token-id byte equality                  | PASS |
-| 2. cosine ≥ 0.998 mean (≥ 0.99 min)        | PASS — mean 0.999999, min 0.999873, p1 0.999997 |
+| 2. cosine + max\_abs                        | PASS — mean 0.999999, min 0.999982, max\_abs 1.35e-3 |
 | 3. two-run MLX determinism                 | PASS — 203776 floats BYTE-IDENTICAL even at fp16 |
 | 4. downstream TAC cluster overlap          | PASS — centroid cosine mean 0.999999, min 0.999998 |
+| 5. search-ranking top-10 overlap            | PASS — avg 1.000, min 1.000 (perfect agreement) |
+
+Notes on the strengthened/new gates:
+
+- **Gate 2 max\_abs floor** (1e-2) catches uniform magnitude drift that
+  cosine alone is blind to (e.g., a missing LayerNorm eps producing a
+  consistent scale shift). Live observed values are ~3.5e-3 fp32 /
+  ~1.35e-3 fp16 — comfortably under the floor but well above the
+  cosine resolution floor, so a future regression to ~5e-2 would fail.
+- **Gate 5 search-ranking** uses the leading `n_queries` docs as
+  queries against the remaining docs, computing ColBERT MaxSim
+  (`sum_q max_d <q,d>`) on both encoders' outputs and comparing top-k
+  retrieval lists. A drift that shuffles rankings while keeping per-
+  token cosine ≥ 0.999 (which is possible — neighboring docs can swap
+  ranks under tiny vector perturbations) shows up here. The fp32
+  baseline shaves to 0.900 min on this small fixture; that's
+  reproducible and at the documented floor.
 
 Cross-corpus spot-check on 1000 real Jira docs (gates 1 + 2 only):
 
@@ -368,6 +391,73 @@ Honest takeaways:
   pylate path, so downstream TAC indexing is interchangeable in
   practice (gate 4 confirmed centroid cosine ≥ 0.99999 at the live
   fixture's kappa=92 budget).
+
+## Post-audit correctness fixes (2026-05-01)
+
+The deep-research audit (`.codex/deep-research-zig-2026-05-01.txt`)
+flagged four MLX/encoder correctness items. All four landed before
+this doc rev:
+
+### 1. MLX BERT LayerNorm eps now threaded from cfg
+
+`tools/export_colbert_to_mlx.py` already records HuggingFace
+`layer_norm_eps` (1e-12 on BERT base) into `config.json`, but
+`tools/encode_mlx.py` was instantiating every `nn.LayerNorm(hidden)`
+without passing it — falling back to MLX's 1e-5 default. That shifts
+LN output on tail tokens with small post-LN variance (the real-world
+failure mode here).
+
+`encode_mlx.py:BertEmbeddings/BertSelfAttention/BertFFN` constructors
+now take `layer_norm_eps` and `ColBertMLX.__init__` reads it from
+`cfg["layer_norm_eps"]`. After the fix, fp16 gate 2 min cosine moved
+from 0.999873 to 0.999982 (a real tail-token improvement, not noise).
+
+### 2. Encoders default to fail-fast; opt-in `--allow-drops`
+
+Both `encode.py` and `encode_mlx.py` previously turned per-batch and
+per-doc encode failures into recorded "dropped" entries and exited 0
+as long as one doc encoded. In a service-style invocation that can
+silently shrink the corpus unless callers parse stderr/metadata.
+
+Default behavior is now fail-fast: any drop raises `SystemExit` with
+the failing doc id and reason. The legacy lenient behavior moved
+behind `--allow-drops`, gated by `--max-drop-rate` (default 0.0 — any
+drop fails — so callers must explicitly accept the rate they're
+willing to tolerate). On the live fixture there are zero drops, so
+the parity harness is unaffected.
+
+### 3. `--sort-by-length` now slot-fills by original index
+
+PyTorch `encode.py --sort-by-length` claimed in its `--help` to
+restore input order at write time, but the implementation explicitly
+left output in encode-by-length order ("let the caller restore order
+if it cares"). MLX `encode_mlx.py` was already slot-filling correctly,
+so the two encoders disagreed on the same flag.
+
+`encode.py::encode_docs` now pre-allocates `slots: list[None]` of
+length `n_input` and writes into `slots[orig_i]` for each batch's
+original input indices. After the loop, `None` entries are dropped
+(only possible under `--allow-drops`). Verified byte-equal token IDs
++ offsets and cosine 1.0 between sorted vs unsorted runs on a 30-doc
+slice of the fixture.
+
+### 4. Parity gates strengthened: gate 2 abs-error + gate 5 search-ranking
+
+Gate 2 was cosine-only (magnitude-invariant); gate 4 compared headers
++ centroid cosine but not assignments, PQ codebooks, HNSW graph,
+inverted lists, or search rankings. Two changes:
+
+- Gate 2 now also enforces a `max_abs` floor (1e-2) on per-element
+  vector deviation. Catches silent magnitude drift that cosine misses.
+- Gate 5 (new) — search-ranking parity. Uses the leading `--n-queries`
+  docs as queries against the rest, computes MaxSim on both PT and
+  MLX outputs, and asserts per-query top-k overlap >=
+  `--search-overlap-floor` (default 0.9). A drift that shuffles
+  rankings while keeping per-token cosine ≥ 0.999 shows up here.
+
+CLI flags exposed: `--n-queries`, `--top-k`, `--search-overlap-floor`.
+Gate 5 piggy-backs on the existing fixture binaries (no extra encode
+pass), so total harness wall-clock is unchanged.
 
 ## Failure modes worth flagging
 
