@@ -145,7 +145,7 @@ fn cmdIndex(iter: *std.process.Args.Iterator, gpa: Allocator, io: std.Io, cwd: s
     );
 
     const t_write_0 = nowNs();
-    try writeFile(io, cwd, op, image.bytes);
+    try writeFile(io, cwd, op, image.bytes, gpa);
     const t_write_1 = nowNs();
     std.debug.print("  wrote {s} in {d:.1} ms\n", .{ op, msBetween(t_write_0, t_write_1) });
 }
@@ -747,14 +747,41 @@ fn slurpAligned8(io: std.Io, dir: std.Io.Dir, path: []const u8, gpa: Allocator) 
     return buf;
 }
 
-fn writeFile(io: std.Io, dir: std.Io.Dir, path: []const u8, bytes: []const u8) !void {
-    var f = try dir.createFile(io, path, .{ .truncate = true });
-    defer f.close(io);
-    var write_buf: [16 * 1024]u8 = undefined;
-    var fw = f.writer(io, &write_buf);
-    const writer = &fw.interface;
-    try writer.writeAll(bytes);
-    try writer.flush();
+/// Atomic write: spool to `<path>.tmp` in the same directory, fsync the
+/// payload, close, then `rename` over the final path. The rename is atomic
+/// on POSIX (same filesystem), so a crash mid-write leaves either the
+/// previous version intact or no file at all — never a half-written `<path>`.
+/// The fsync ensures the bytes are durable on disk before the rename, so a
+/// power loss right after rename can't surface a renamed-but-empty inode.
+/// On any error path the temp file is deleted via `errdefer`.
+fn writeFile(io: std.Io, dir: std.Io.Dir, path: []const u8, bytes: []const u8, gpa: Allocator) !void {
+    const tmp_path = try std.fmt.allocPrint(gpa, "{s}.tmp", .{path});
+    defer gpa.free(tmp_path);
+
+    // If a previous run died mid-write the stale .tmp may still be there;
+    // creating with truncate=true overwrites it, so we don't need to unlink first.
+    var f = try dir.createFile(io, tmp_path, .{ .truncate = true });
+    var closed = false;
+    errdefer {
+        if (!closed) f.close(io);
+        // Best-effort cleanup of the temp file on any error path so we
+        // don't leak `<path>.tmp` artifacts after a failed write.
+        dir.deleteFile(io, tmp_path) catch {};
+    }
+
+    {
+        var write_buf: [16 * 1024]u8 = undefined;
+        var fw = f.writer(io, &write_buf);
+        const writer = &fw.interface;
+        try writer.writeAll(bytes);
+        try writer.flush();
+    }
+
+    try f.sync(io);
+    f.close(io);
+    closed = true;
+
+    try dir.rename(tmp_path, dir, path, io);
 }
 
 /// Monotonic ns timestamp via posix clock_gettime(CLOCK_MONOTONIC).
@@ -811,4 +838,89 @@ fn printUsage() void {
 test "constants are accessible from main module" {
     try std.testing.expectEqual(@as(u32, 128), tac.constants.TAC_MU);
     try std.testing.expectEqual(@as(u32, 32), tac.constants.PQ_M);
+}
+
+test "writeFile: final path contains complete bytes after rename, no .tmp leak" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+
+    const payload: []const u8 = "TAC_TKN1\x02\x00\x00\x00abcdefghijklmnop";
+    try writeFile(io, tmp.dir, "out.bin", payload, std.testing.allocator);
+
+    var f = try tmp.dir.openFile(io, "out.bin", .{});
+    defer f.close(io);
+    const stat = try f.stat(io);
+    try std.testing.expectEqual(@as(u64, payload.len), stat.size);
+
+    var buf: [64]u8 = undefined;
+    var read_buf: [128]u8 = undefined;
+    var fr = f.reader(io, &read_buf);
+    try fr.interface.readSliceAll(buf[0..payload.len]);
+    try std.testing.expectEqualSlices(u8, payload, buf[0..payload.len]);
+
+    // After a successful write the temp file must be gone — no leak.
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.openFile(io, "out.bin.tmp", .{}),
+    );
+}
+
+test "writeFile: existing final path is replaced atomically" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+
+    try writeFile(io, tmp.dir, "out.bin", "old-content-123", std.testing.allocator);
+    try writeFile(io, tmp.dir, "out.bin", "new-content-XYZW", std.testing.allocator);
+
+    var f = try tmp.dir.openFile(io, "out.bin", .{});
+    defer f.close(io);
+    const stat = try f.stat(io);
+    try std.testing.expectEqual(@as(u64, 16), stat.size);
+
+    var buf: [16]u8 = undefined;
+    var read_buf: [32]u8 = undefined;
+    var fr = f.reader(io, &read_buf);
+    try fr.interface.readSliceAll(&buf);
+    try std.testing.expectEqualSlices(u8, "new-content-XYZW", &buf);
+}
+
+test "writeFile: rename failure leaves prior content intact and cleans up tmp" {
+    // Simulate a write failure by pre-creating a non-empty directory at the
+    // final path: createFile on `<path>.tmp` succeeds but the final rename
+    // (regular file over a non-empty directory) fails on POSIX. The
+    // errdefer must delete `<path>.tmp` so we don't leak the artifact.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+
+    // Pre-existing directory at the would-be final path with a sentinel
+    // file inside so the rename is unambiguously rejected.
+    {
+        var blocker = try tmp.dir.createDirPathOpen(io, "out.bin", .{});
+        defer blocker.close(io);
+        var sentinel = try blocker.createFile(io, "sentinel", .{ .truncate = true });
+        defer sentinel.close(io);
+        var write_buf: [32]u8 = undefined;
+        var sw = sentinel.writer(io, &write_buf);
+        try sw.interface.writeAll("do-not-clobber");
+        try sw.interface.flush();
+    }
+
+    const result = writeFile(io, tmp.dir, "out.bin", "fresh-payload", std.testing.allocator);
+    try std.testing.expect(std.meta.isError(result));
+
+    // Sentinel inside the blocking dir must still be there: no clobber,
+    // no half-written final artifact.
+    var blocker2 = try tmp.dir.openDir(io, "out.bin", .{});
+    defer blocker2.close(io);
+    var s = try blocker2.openFile(io, "sentinel", .{});
+    s.close(io);
+
+    // Temp artifact must be cleaned up despite the rename failure.
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.openFile(io, "out.bin.tmp", .{}),
+    );
 }
