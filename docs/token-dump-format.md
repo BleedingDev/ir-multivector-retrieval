@@ -101,6 +101,33 @@ a dump.
 maps back to a string identifier from `docs.jsonl`, this is where we
 recover it.
 
+## Queries mode (`--mode queries`) + `.qids` sidecar
+
+The same binary layout is reused for query-side encoding. Differences:
+
+- Each "doc" row in the binary is one **query**, encoded with
+  `model.tokenize(text, is_query=True)` so the [Q] prefix is added and
+  pylate's max_query_length padding kicks in.
+- The skiplist drop is **not applied**: queries keep all attended tokens
+  per paper §5.
+- `token_ids` are still real BERT vocabulary IDs.
+- Metadata flips `mode: "queries"` and uses `qid_map` instead of
+  `doc_id_map`.
+
+A binary sidecar `<out>.qids` is written alongside the bin file. Format:
+
+```
+offset   size               field
+0        4 * n_queries      qids        = u32[], one per encoded query in CSR row order
+```
+
+This is the canonical loader path for the bench harness (`benchmarks/`):
+mmap the `.qids` and slice `[]const u32` directly. `qid_map` in the JSON
+metadata is the human-readable counterpart for inspection.
+
+`.qids` requires int-parseable qids. MS MARCO and LoTTE both qualify;
+non-numeric qids raise `SystemExit` at encode time.
+
 ## Versioning
 
 Increment `version` on any breaking change to the binary layout. The Zig

@@ -349,6 +349,34 @@ def write_tokens_bin(out_path: Path, encoded: list[EncodedDoc], dim: int) -> dic
     return {"n_docs": n_docs, "n_tokens": n_tokens, "dim": dim}
 
 
+def write_qids_sidecar(qids_path: Path, qid_strings: list[str]) -> None:
+    """In queries mode write a flat little-endian u32 array of length
+    `n_queries`, one entry per encoded query in the same order as the
+    binary's CSR row order. The bench harness reads this directly without
+    JSON parsing.
+
+    qids must be integer-parseable strings (MS MARCO + LoTTE both qualify).
+    Non-numeric qids fail-fast — the format is intentionally narrow so the
+    Zig loader stays a single `[]const u32` slice over an mmap region.
+    """
+    qids_path.parent.mkdir(parents=True, exist_ok=True)
+    with qids_path.open("wb") as f:
+        for q in qid_strings:
+            try:
+                qi = int(q)
+            except ValueError as e:
+                raise SystemExit(
+                    f"qid {q!r} is not int-parseable; .qids sidecar requires "
+                    "numeric qids (MS MARCO / LoTTE qualify)."
+                ) from e
+            if qi < 0 or qi > 0xFFFF_FFFF:
+                raise SystemExit(
+                    f"qid {qi} outside u32 range; .qids sidecar requires "
+                    "0 <= qid <= 2^32-1."
+                )
+            f.write(struct.pack("<I", qi))
+
+
 def write_metadata(
     meta_path: Path,
     *,
@@ -441,6 +469,15 @@ def main() -> None:
         docs_jsonl=args.docs,
     )
     print(f"wrote metadata {meta_path}", file=sys.stderr)
+
+    if args.mode == "queries":
+        qids_path = args.out.with_suffix(args.out.suffix + ".qids")
+        write_qids_sidecar(qids_path, [d.doc_id for d in encoded])
+        print(
+            f"wrote qids sidecar {qids_path} "
+            f"(n_queries={len(encoded)}, u32 LE)",
+            file=sys.stderr,
+        )
 
 
 if __name__ == "__main__":
