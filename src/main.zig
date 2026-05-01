@@ -53,6 +53,10 @@ fn cmdIndex(iter: *std.process.Args.Iterator, gpa: Allocator, io: std.Io, cwd: s
     var out_path: ?[]const u8 = null;
     var kappa: u32 = 4096;
     var seed: u64 = 42;
+    var mu: u32 = tac.constants.TAC_MU;
+    var tau: u32 = tac.constants.TAC_TAU;
+    var epsilon: u32 = tac.constants.TAC_EPSILON;
+    var theta: u32 = tac.constants.TAC_THETA;
     var positional: u32 = 0;
 
     while (iter.next()) |arg| {
@@ -60,6 +64,14 @@ fn cmdIndex(iter: *std.process.Args.Iterator, gpa: Allocator, io: std.Io, cwd: s
             kappa = try std.fmt.parseInt(u32, iter.next() orelse return error.MissingArg, 10);
         } else if (std.mem.eql(u8, arg, "--seed")) {
             seed = try std.fmt.parseInt(u64, iter.next() orelse return error.MissingArg, 10);
+        } else if (std.mem.eql(u8, arg, "--mu")) {
+            mu = try std.fmt.parseInt(u32, iter.next() orelse return error.MissingArg, 10);
+        } else if (std.mem.eql(u8, arg, "--tau")) {
+            tau = try std.fmt.parseInt(u32, iter.next() orelse return error.MissingArg, 10);
+        } else if (std.mem.eql(u8, arg, "--epsilon")) {
+            epsilon = try std.fmt.parseInt(u32, iter.next() orelse return error.MissingArg, 10);
+        } else if (std.mem.eql(u8, arg, "--theta")) {
+            theta = try std.fmt.parseInt(u32, iter.next() orelse return error.MissingArg, 10);
         } else if (std.mem.startsWith(u8, arg, "--")) {
             std.debug.print("unknown flag: {s}\n", .{arg});
             return error.UnknownFlag;
@@ -88,10 +100,23 @@ fn cmdIndex(iter: *std.process.Args.Iterator, gpa: Allocator, io: std.Io, cwd: s
         .{ td.n_docs, td.n_tokens, td.dim, msBetween(t_load_0, t_load_1) },
     );
 
+    if (mu != tac.constants.TAC_MU or tau != tac.constants.TAC_TAU or
+        epsilon != tac.constants.TAC_EPSILON or theta != tac.constants.TAC_THETA)
+    {
+        std.debug.print(
+            "  paper-relax: μ={d} (default {d}), τ={d} (default {d}), ε={d} (default {d}), θ={d} (default {d})\n",
+            .{ mu, tac.constants.TAC_MU, tau, tac.constants.TAC_TAU, epsilon, tac.constants.TAC_EPSILON, theta, tac.constants.TAC_THETA },
+        );
+    }
+
     const t_build_0 = nowNs();
     var image = try tac.index.storage.build(&td, .{
         .kappa_total = kappa,
         .seed = seed,
+        .mu = mu,
+        .tau = tau,
+        .epsilon = epsilon,
+        .theta = theta,
     }, gpa);
     defer image.deinit(gpa);
     const t_build_1 = nowNs();
@@ -266,10 +291,12 @@ fn printUsage() void {
         \\
         \\Usage:
         \\  tac index <tokens.bin> <out.tac> [--kappa N] [--seed N]
+        \\                                   [--mu N] [--tau N] [--epsilon N] [--theta N]
         \\  tac search <index.tac> <queries.bin> [--kappa-c N] [--kappa-d N] [--alpha F] [--top-k N]
         \\
         \\Defaults: kappa=4096, seed=42, kappa-c=80, kappa-d=1000, top-k=10.
-        \\Paper-strict TAC/PQ/HNSW constants: see src/constants.zig.
+        \\Paper-strict μ=128, τ=256, ε=4, θ=39 (override only when corpus
+        \\vocabulary diversity exceeds n_tokens/θ — e.g. Czech multilingual).
         \\
     , .{});
 }
