@@ -42,4 +42,29 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+
+    // Live tests gate Python/torch/pylate-dependent harnesses behind a build
+    // option so the default `zig build test` stays Python-free for any
+    // contributor who hasn't provisioned tools/.venv. Enable explicitly:
+    //
+    //   zig build test -Dlive=true
+    //
+    // Live test sources live under tests/live/ and import the public `tac`
+    // module just like in-tree unit tests. Owner: primitives-engineer (task #24).
+    const live = b.option(
+        bool,
+        "live",
+        "Include live torch+pylate-dependent tests under tests/live/",
+    ) orelse false;
+    if (live) {
+        const live_mod = b.createModule(.{
+            .root_source_file = b.path("tests/live/vocab_aliasing.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        live_mod.addImport("tac", lib_mod);
+        const live_tests = b.addTest(.{ .root_module = live_mod });
+        const run_live_tests = b.addRunArtifact(live_tests);
+        test_step.dependOn(&run_live_tests.step);
+    }
 }
