@@ -16,6 +16,24 @@ A from-paper reimplementation of **Tachiom** — *Efficient Multivector Retrieva
 
 Clustering target: 600M token vectors → 262K centroids in ~8 minutes on a 64-thread Xeon.
 
+## Measured performance (Apple Silicon, 10 cores)
+
+Initial benchmark on a 2,000-doc Jira corpus (Czech), `jinaai/jina-colbert-v2-64`, dim=64, 117,645 token vectors, kappa=10240:
+
+| Build phase       | 1 thread | 10 threads | Speedup |
+|-------------------|---------:|-----------:|--------:|
+| `tac.clusterFlat` |    218 ms |     164 ms | 1.3× |
+| residuals + norms |      9 ms |       9 ms | —    |
+| **`pq.train`**    |  42,575 ms |  **7,605 ms** | **5.6×** |
+| `pq.encode`       |    820 ms |     827 ms | —    |
+| `hnsw.build`      |  3,838 ms |   3,790 ms | —    |
+| serialise         |     16 ms |      16 ms | —    |
+| **Total**         |  **47,477 ms** |  **12,413 ms** | **3.8×** |
+
+Search latency (paper-strict single-core): **~27 ms / query** at `kappa_c=80, kappa_d=1000` on the same index. Quality smoke: top hit on `"Jak nastavit DKIM a SPF pro newslettery z jiné domény?"` is `jira:ABC-1` (the matching Jira ticket), agreeing with the WARP baseline at `ir-expo/services/warp-service`.
+
+PQ training was the dominant bottleneck (90% of single-thread build); the M=32 subspaces are independent so static-chunk parallelism scales nearly linearly to ~32 threads. HNSW build is the next target — currently single-threaded.
+
 ## Why Zig
 
 - Single-core retrieval target → no GC pauses, predictable allocation, manual SIMD via `@Vector(N, T)`.
