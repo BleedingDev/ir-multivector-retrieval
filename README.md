@@ -41,11 +41,11 @@ Two corpora on a real Czech Jira ticket archive, `jinaai/jina-colbert-v2-64`, di
 | Metal encode (pylate, fp32, batch=64) | **48 min** | GPU-bound; FP16 + larger batch is 4-6× ahead |
 | `tac.clusterFlat` (parallel) | 5.6 s | |
 | residuals + norms (parallel) | 29 ms | |
-| **`pq.train` (parallel)** | **113.0 s** | 91% of build wall-clock now; within-subspace parallelism is next |
-| `pq.encode` (parallel) | 2.0 s | |
-| **`hnsw.build` (parallel, 10 threads)** | **2.94 s** | down from 17.0 s serial — chunked deferred-commit, paper-strict deterministic CSR ([plan-06](.codex/plans/post-hackathon-06-hnsw-parallel.plan.md)) |
-| serialise | 0.20 s | |
-| **Build total (10 threads)** | **2 min 4 s** | 11 s saved vs prior 2 min 15 s |
+| **`pq.train` (parallel + within-subspace ready)** | **115.8 s** | now paper-strict deterministic across thread counts ([plan-07](.codex/plans/post-hackathon-07-within-subspace-kmeans.plan.md)) — kmeans.fit gains an `n_threads` knob and byte-equal n_threads=1↔10 centroids |
+| `pq.encode` (parallel) | 2.2 s | |
+| **`hnsw.build` (parallel, 10 threads)** | **5.6 s** | chunked deferred-commit, paper-strict deterministic CSR ([plan-06](.codex/plans/post-hackathon-06-hnsw-parallel.plan.md)) |
+| serialise | 0.21 s | |
+| **Build total (10 threads)** | **2 min 8 s** | within-subspace inner parallelism gated to `n_threads > M` so the typical 10-thread case avoids oversubscription |
 | **Search latency** | **~54 ms / query** | paper-strict single-core, `kappa_c=80, kappa_d=1000` |
 | **Index size** | **75.8 MB** | for 26,678 Jira tickets |
 
@@ -57,7 +57,7 @@ Quality smoke on Czech queries:
 
 Build was 47.5 s single-thread on the 2 k chunk; we got it to 12.4 s by parallelising the four embarrassingly-parallel stages (TAC per-token, PQ train per-subspace, PQ encode per-token, residuals per-token). HNSW build was the next lever — at 26 k it was 17.0 s serial; we replaced it with a chunked deferred-commit parallel build (paper-strict deterministic) which lands at **2.94 s on 10 threads (5.8× speedup)**, saving 14 s on full-corpus build wall time. PQ training stays dominant because M=32 subspaces / 10 threads is the cap. The remaining levers, in order of payoff:
 
-1. **Within-subspace k-means parallelism** — split each subspace's 117k–1.5M vectors across cores (could 2-3× pq.train on top of subspace parallelism). Now the biggest single lever since HNSW is no longer the bottleneck.
+1. **Within-subspace k-means parallelism** — *infrastructure shipped ([plan-07](.codex/plans/post-hackathon-07-within-subspace-kmeans.plan.md))* but inactive at the typical 10-thread invocation: `kmeans.fit` now takes `n_threads` and parallelises the per-vector argmin across static chunks while keeping the f32 reduction order serial-in-vector-order, so n_threads=1 ↔ n_threads=10 produce **byte-equal** centroids (paper-strict). At `--threads 10` on M=32 / 10 cores the subspace-level parallelism already saturates; passing more inner threads only oversubscribes (measured 113s → 121s at inner=10, 113s → 135s at inner=2). The within-subspace path gates on `n_threads > M`, so it activates when a user runs e.g. `--threads 64`. The real win remaining is **work-stealing across subspaces** (chunk=ceil(32/10)=4 leaves 2 of 10 outer threads idle through the whole pq.train; a shared atomic queue would close that gap).
 2. **FP16 Metal inference + bigger batches in the encoder** — 4-6× on the 48-minute encode; the single biggest absolute win since encode is 95 % of total ingestion cost.
 
 ## Why Zig
