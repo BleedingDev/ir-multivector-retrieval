@@ -1,0 +1,12 @@
+# Same bench against pre-existing data/jira/jira_full.tac (built at HEAD~before audit)
+# date_utc = 2026-05-01T21:51:46Z
+jira_latency: kappa_c=80 kappa_d=1000 n_queries=3 iters=30 warmup=5 cooldown_ms=50
+
+jira_latency: aggregate over 90 samples (30 iters × 3 queries):
+  avg = 332.568 ms
+  min = 159.013 ms
+  p1  = 159.013 ms
+  p50 = 321.341 ms
+  p95 = 541.307 ms
+  p99 = 919.042 ms
+  max = 919.042 ms

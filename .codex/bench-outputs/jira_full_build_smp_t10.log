@@ -1,0 +1,47 @@
+# tac index — full Jira build rebench under L10 harness
+# command       = zig-out/bin/tac index data/jira/tokens_full.bin data/jira/jira_full_rebench.tac --kappa 32768 --threads 10
+# git_sha       = 03ddb1df9aa412935e086ecfbe2b063198c045cd
+# git_describe  = hackathon-2026-05-01-followup-v2-29-g03ddb1d
+# allocator     = std.heap.smp_allocator (per L12 03ddb1d)
+# timer         = clock_gettime(CLOCK_MONOTONIC)
+# host          = Darwin Sathanovo.local arm64
+# cpu           = Apple M5 (10 cores)
+# zig_version   = 0.16.0
+# optimize      = ReleaseFast
+# date_utc      = 2026-05-01T21:39:42Z
+# input_size    = 395880692 bytes (tokens_full.bin)
+# warmup        = none (single-shot end-to-end build; warm-up is search-side discipline only)
+#
+tac index: tokens=data/jira/tokens_full.bin out=data/jira/jira_full_rebench.tac kappa=32768 seed=42
+  loaded 26678 docs / 1521797 tokens / dim=64 in 224.8 ms
+  parallel build: 10 threads
+    [stage] tac.clusterFlat:   10467.2 ms
+    [stage] residuals + norms:     56.3 ms
+    [stage] pq.train:          153767.4 ms
+    [stage] pq.encode:           1663.6 ms
+    [hnsw] n=32768 threads=10 build_total=5603.0ms greedy=0.0ms search=0.0ms heuristic=0.0ms connect=19.6ms
+    [stage] hnsw.build:          5611.8 ms
+    [stage] inverted_list:         13.1 ms
+    [stage] serialise:            307.7 ms
+  built index in 171896.1 ms: 79427800 bytes (75.75 MB)
+  wrote data/jira/jira_full_rebench.tac in 18.3 ms
+real 172.16
+user 891.30
+sys 10.23
+          1062961152  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              149908  page reclaims
+                   9  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                  30  voluntary context switches
+             2074648  involuntary context switches
+       8031973309782  instructions retired
+       2166866227489  cycles elapsed
+          1120732480  peak memory footprint

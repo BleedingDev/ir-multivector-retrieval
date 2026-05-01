@@ -1,0 +1,11 @@
+# date_utc = 2026-05-01T22:10:50Z (post 60s idle, cooldown=200ms)
+jira_latency: kappa_c=80 kappa_d=1000 n_queries=3 iters=30 warmup=5 cooldown_ms=200
+
+jira_latency: aggregate over 90 samples (30 iters × 3 queries):
+  avg = 110.599 ms
+  min = 90.236 ms
+  p1  = 90.236 ms
+  p50 = 106.609 ms
+  p95 = 143.716 ms
+  p99 = 152.884 ms
+  max = 152.884 ms

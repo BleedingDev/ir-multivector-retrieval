@@ -1,0 +1,39 @@
+# tac index — full Jira build rebench under L10 harness (run 2 for variance)
+# command       = zig-out/bin/tac index data/jira/tokens_full.bin data/jira/jira_full_rebench.tac --kappa 32768 --threads 10
+# git_sha       = 03ddb1df9aa412935e086ecfbe2b063198c045cd
+# allocator     = std.heap.smp_allocator (per L12 03ddb1d)
+# date_utc      = 2026-05-01T21:42:43Z
+#
+tac index: tokens=data/jira/tokens_full.bin out=data/jira/jira_full_rebench.tac kappa=32768 seed=42
+  loaded 26678 docs / 1521797 tokens / dim=64 in 177.3 ms
+  parallel build: 10 threads
+    [stage] tac.clusterFlat:    8239.3 ms
+    [stage] residuals + norms:     50.0 ms
+    [stage] pq.train:          218950.7 ms
+    [stage] pq.encode:           4938.8 ms
+    [hnsw] n=32768 threads=10 build_total=12958.8ms greedy=0.0ms search=0.0ms heuristic=0.0ms connect=31.5ms
+    [stage] hnsw.build:         12969.7 ms
+    [stage] inverted_list:         17.9 ms
+    [stage] serialise:            335.1 ms
+  built index in 245515.8 ms: 79427800 bytes (75.75 MB)
+  wrote data/jira/jira_full_rebench.tac in 36.3 ms
+real 245.77
+user 943.79
+sys 18.60
+          1119322112  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              204740  page reclaims
+                  17  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                  96  voluntary context switches
+             3619541  involuntary context switches
+       8054766077878  instructions retired
+       2210102630074  cycles elapsed
+          1119470960  peak memory footprint

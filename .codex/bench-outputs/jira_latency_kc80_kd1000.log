@@ -1,0 +1,15 @@
+# command  = ./zig-out/bin/bench_jira_latency --index data/jira/jira_full_rebench.tac --queries data/jira/queries.bin --qids data/jira/queries.bin.qids --qrels .codex/bench-outputs/jira_smoke_qrels.trec.tsv --out .codex/bench-outputs/jira_latency_kc80_kd1000.csv --kappa-c 80 --kappa-d 1000 --iters 30 --warmup 5 --cooldown-ms 50
+# git_sha = 03ddb1df9aa412935e086ecfbe2b063198c045cd
+# date_utc = 2026-05-01T21:50:10Z
+# host    = Darwin Sathanovo.local arm64, Apple M5, 10 cores
+# zig     = 0.16.0
+jira_latency: kappa_c=80 kappa_d=1000 n_queries=3 iters=30 warmup=5 cooldown_ms=50
+
+jira_latency: aggregate over 90 samples (30 iters × 3 queries):
+  avg = 339.451 ms
+  min = 152.427 ms
+  p1  = 152.427 ms
+  p50 = 275.992 ms
+  p95 = 710.231 ms
+  p99 = 1160.722 ms
+  max = 1160.722 ms
