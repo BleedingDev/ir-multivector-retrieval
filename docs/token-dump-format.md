@@ -1,6 +1,16 @@
 # Token-dump file format (`tokens.bin`)
 
-Status: **frozen** for index version 1.
+Status: **frozen** for index version 2.
+
+Version history:
+- v1 (deprecated, rejected by the loader): `token_ids` were *positional*
+  per-doc indices (0..n_tok). This silently degenerated paper §3 TAC
+  bucketing and is no longer accepted.
+- v2 (current): `token_ids` are real BERT vocabulary IDs from the
+  tokenizer, with the ColBERT [D] prefix preserved and the model's
+  skiplist (punctuation by default) dropped — matching what
+  `pylate.models.ColBERT.encode(..., is_query=False, normalize=True)`
+  keeps.
 
 This file is the bridge between the Python ColBERTv2 encoder
 (`tools/encode.py`, owned by primitives-engineer) and the Zig pipeline
@@ -17,7 +27,7 @@ binary32** (`f32`), little-endian.
 ```
 offset    size                   field
 0         8                      magic           = "TAC_TKN1" (ASCII)
-8         4                      version         = u32, currently 1
+8         4                      version         = u32, currently 2
 12        4                      dim             = u32, embedding dimensionality
 16        8                      n_docs          = u64, number of documents
 24        8                      n_tokens        = u64, total token vectors
@@ -53,7 +63,7 @@ let emb = vectors[i*dim .. (i+1)*dim]
 - File length matches header sizes exactly. Truncated or oversized files
   are rejected.
 - `magic == "TAC_TKN1"` byte for byte.
-- `version == 1`.
+- `version == 2`. v1 files (positional ids) are explicitly rejected.
 - `dim > 0` and `dim <= 4096` (sanity ceiling — current ColBERTv2 outputs
   128-d).
 - `n_tokens > 0`. Empty corpora have nothing for downstream code to do.
@@ -74,7 +84,7 @@ a dump.
 
 ```json
 {
-  "format_version": 1,
+  "format_version": 2,
   "encoder": "colbert-ir/colbertv2.0",
   "encoder_revision": "<hf revision hash>",
   "encoder_dim": 128,
@@ -83,7 +93,7 @@ a dump.
   "doc_id_map": ["doc-0", "doc-1", "..."],
   "built_at": "2026-05-01T12:34:56Z",
   "tool": "tools/encode.py",
-  "tool_version": "0.1"
+  "tool_version": "0.2"
 }
 ```
 

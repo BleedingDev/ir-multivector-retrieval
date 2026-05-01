@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tools/encode.py — ColBERTv2 → token-dump binary.
+"""tools/encode.py — ColBERTv2 → token-dump binary (format v2, real vocab IDs).
 
 Owner: primitives-engineer.
 See plan 01-primitives-and-io.plan.md and docs/token-dump-format.md.
@@ -9,6 +9,12 @@ fields), encodes each document with a ColBERT-style model (default
 `colbert-ir/colbertv2.0` via pylate), L2-normalises the per-token
 embeddings, and writes the flat-binary format defined in
 docs/token-dump-format.md plus a sidecar `tokens.meta.json`.
+
+Format v2 (this version) emits **real BERT vocabulary IDs** in
+`token_ids[i]` so paper §3 TAC bucketing aggregates by surface vocabulary
+("the" across docs lands in one cluster). v1 stored positional ids per
+doc and degenerated TAC; the Zig parser rejects v1 files outright since
+the constant flipped to 2.
 
 Usage:
     python tools/encode.py \\
@@ -22,6 +28,15 @@ The model defaults to `colbert-ir/colbertv2.0` to match the paper. A
 sibling project (ir-expo) found `jinaai/jina-colbert-v2-64` works
 identically through the same pylate path; pass `--model` (with
 `--trust-remote-code` for jina) to override.
+
+We bypass `pylate.models.ColBERT.encode` because that wrapper does not
+return per-token vocab IDs in lockstep with the token embeddings.
+Instead we drive `model.tokenize` → `model.forward` → `model.skiplist_mask`
+ourselves and apply the exact same keep-mask to both the input_ids and
+the token_embeddings. This mirrors the embedding-keep logic from
+`pylate/models/colbert.py::encode` (lines ~688–720) one-for-one so the
+emitted vectors are byte-identical to what `model.encode` would have
+produced.
 
 Determinism: pylate/transformers pin model weights by revision; the
 output bytes for a given (model, revision, doc list) are reproducible
@@ -48,7 +63,7 @@ from pathlib import Path
 
 
 TOKEN_DUMP_MAGIC = b"TAC_TKN1"  # must match src/constants.zig
-TOKEN_DUMP_VERSION = 1
+TOKEN_DUMP_VERSION = 2  # v2 = real vocab IDs (lead bumps src/constants.zig in lockstep)
 DTYPE_F32 = 0
 HEADER_SIZE = 40  # magic(8) + version(4) + dim(4) + n_docs(8) + n_tokens(8) + dtype(1) + reserved(7)
 
@@ -137,8 +152,26 @@ def encode_docs(
     """Returns (encoded, dropped, dim).
 
     `dropped` is a list of (doc_id, reason) for docs that failed to encode.
+
+    Per-doc shape contract (mirrors `pylate.models.ColBERT.encode` for
+    is_query=False, normalize=True):
+        features = model.tokenize(texts, is_query=False)
+            features["input_ids"]:      [B, T]   real BERT vocab IDs,
+                                                  with [D] prefix inserted
+            features["attention_mask"]: [B, T]
+        out = model.forward(features)
+            out["token_embeddings"]:    [B, T, dim]
+            out["attention_mask"]:      [B, T]
+        skip = model.skiplist_mask(features["input_ids"], model.skiplist)
+        keep = (skip & out["attention_mask"]).bool()
+        for b in range(B):
+            kept_ids[b] = features["input_ids"][b, keep[b]]
+            kept_emb[b] = out["token_embeddings"][b, keep[b], :]
+            kept_emb[b] = F.normalize(kept_emb[b], p=2, dim=1)
+
+    The keep-mask is applied identically to both input_ids and embeddings,
+    so token_ids[i] is the BERT vocab id of the same row as vectors[i].
     """
-    # Lazy import so --help is fast.
     import torch  # type: ignore
     from pylate import models  # type: ignore
 
@@ -147,50 +180,65 @@ def encode_docs(
         trust_remote_code=trust_remote_code,
         device=device,
     )
+    model.eval()
 
     encoded: list[EncodedDoc] = []
     dropped: list[tuple[str, str]] = []
     dim: int | None = None
 
+    target_device = torch.device(device)
+
     for batch_start in range(0, len(docs), batch_size):
         batch = docs[batch_start : batch_start + batch_size]
         texts = [d["text"] for d in batch]
         try:
-            outs = model.encode(
-                texts,
-                convert_to_numpy=False,
-                convert_to_tensor=False,
-                is_query=False,
-                show_progress_bar=False,
-            )
+            features = model.tokenize(texts, is_query=False)
+            features = {
+                k: (v.to(target_device) if hasattr(v, "to") else v)
+                for k, v in features.items()
+            }
+            with torch.no_grad():
+                out = model.forward(input=features)
+            input_ids = features["input_ids"]  # [B, T]
+            tok_emb = out["token_embeddings"]  # [B, T, dim]
+            attn = out["attention_mask"].bool()
+            skip = model.skiplist_mask(input_ids=input_ids, skiplist=model.skiplist).bool()
+            keep = skip & attn  # [B, T]
         except Exception as e:  # noqa: BLE001
             for d in batch:
                 dropped.append((str(d["doc_id"]), f"batch encode failed: {e!r}"))
             continue
 
-        for d, out in zip(batch, outs):
+        for b, d in enumerate(batch):
             try:
-                t = (
-                    out.detach().cpu().float()
-                    if isinstance(out, torch.Tensor)
-                    else torch.tensor(out).float()
-                )
-                # pylate already L2-normalises ColBERT outputs but we
-                # renormalise defensively — the Zig parser doesn't.
-                t = torch.nn.functional.normalize(t, dim=1)
-                if t.dim() != 2:
+                kept_mask = keep[b]
+                kept_ids = input_ids[b][kept_mask].detach().cpu().tolist()
+                kept_emb = tok_emb[b][kept_mask].detach().cpu().float()
+                # Defensive renormalize — matches the encode() path
+                # (normalize_embeddings=True is the pylate default).
+                kept_emb = torch.nn.functional.normalize(kept_emb, p=2, dim=1)
+
+                if kept_emb.dim() != 2:
                     dropped.append(
-                        (str(d["doc_id"]), f"unexpected encoder shape {tuple(t.shape)}")
+                        (str(d["doc_id"]), f"unexpected encoder shape {tuple(kept_emb.shape)}")
                     )
                     continue
-                n_tok, d_dim = int(t.shape[0]), int(t.shape[1])
+                n_tok, d_dim = int(kept_emb.shape[0]), int(kept_emb.shape[1])
                 if d_dim == 0 or d_dim > MAX_DIM:
                     dropped.append(
                         (str(d["doc_id"]), f"dim {d_dim} outside [1, {MAX_DIM}]")
                     )
                     continue
                 if n_tok == 0:
-                    dropped.append((str(d["doc_id"]), "0-token output"))
+                    dropped.append((str(d["doc_id"]), "0-token output after masking"))
+                    continue
+                if len(kept_ids) != n_tok:
+                    dropped.append(
+                        (
+                            str(d["doc_id"]),
+                            f"id/embedding length mismatch: {len(kept_ids)} != {n_tok}",
+                        )
+                    )
                     continue
                 if dim is None:
                     dim = d_dim
@@ -202,20 +250,11 @@ def encode_docs(
                         )
                     )
                     continue
-                # paper-gap: pylate doesn't surface real vocab ids in a
-                # uniform way across revisions, so v1 of tokens.bin stores
-                # positional ids 0..n_tok per doc. The TAC clusterer treats
-                # token_id as a grouping key, so today the per-doc bucketing
-                # is degenerate. We document this in tokens.meta.json so a
-                # future encoder upgrade can populate real ids without an
-                # on-disk format change.
-                token_ids = list(range(n_tok))
-                vectors = t.tolist()
                 encoded.append(
                     EncodedDoc(
                         doc_id=str(d["doc_id"]),
-                        token_ids=token_ids,
-                        vectors=vectors,
+                        token_ids=[int(x) for x in kept_ids],
+                        vectors=kept_emb.tolist(),
                     )
                 )
             except Exception as e:  # noqa: BLE001
@@ -291,11 +330,13 @@ def write_metadata(
         "dropped": [{"doc_id": d, "reason": r} for d, r in dropped],
         "built_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
         "tool": "tools/encode.py",
-        "tool_version": "0.1",
+        "tool_version": "0.2",
         "source_jsonl": str(docs_jsonl),
         "notes": [
-            "token_ids are positional within each doc, not vocabulary ids "
-            "(see encode.py paper-gap comment).",
+            "token_ids are real BERT vocabulary IDs from "
+            "tokenizer(text)['input_ids'] with the ColBERT [D] prefix "
+            "preserved and skiplist (punctuation) tokens dropped, exactly "
+            "matching pylate.models.ColBERT.encode's keep-mask. Format v2.",
         ],
     }
     meta_path.parent.mkdir(parents=True, exist_ok=True)
