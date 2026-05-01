@@ -247,21 +247,53 @@ def gate1_token_ids(pt: dict, mlx: dict) -> tuple[bool, str]:
     return True, f"token_ids byte-equal ({len(pt['ids'])} ids; offsets equal)"
 
 
-def gate2_cosine(pt: dict, mlx: dict, mean_floor: float, min_floor: float) -> tuple[bool, str]:
+def gate2_cosine(
+    pt: dict,
+    mlx: dict,
+    mean_floor: float,
+    min_floor: float,
+    abs_floor: float,
+) -> tuple[bool, str]:
+    """Cosine + absolute-error gate.
+
+    Cosine alone is magnitude-invariant: a uniform-scale magnitude shift
+    leaves all cosines at 1.0 even though absolute values diverge. We
+    pair the cosine floors with a max-abs-element check so a silent
+    magnitude drift (e.g., a botched LayerNorm eps, a missing
+    .normalize() call) shows up.
+
+    L2-normalised ColBERT vectors have |x| ≤ 1, so per-element abs error
+    is bounded by 2; values much above 1e-3 indicate real semantic drift.
+    """
     cos = cosines_per_token(pt, mlx)
     cos_sorted = sorted(cos)
     n = len(cos)
     mean = sum(cos) / n
     cmin = cos_sorted[0]
     p1 = cos_sorted[max(0, n // 100)]
+
+    # Max absolute deviation per element across all (token, dim) pairs.
+    if pt["n_tok"] != mlx["n_tok"] or pt["dim"] != mlx["dim"]:
+        return False, (
+            f"shape mismatch: pt n_tok={pt['n_tok']} dim={pt['dim']} vs "
+            f"mlx n_tok={mlx['n_tok']} dim={mlx['dim']}"
+        )
+    max_abs = 0.0
+    for x, y in zip(pt["vecs"], mlx["vecs"]):
+        d = abs(x - y)
+        if d > max_abs:
+            max_abs = d
+
     msg = (
         f"cosine mean={mean:.6f} min={cmin:.6f} p1={p1:.6f} "
-        f"max={cos_sorted[-1]:.6f} (n={n})"
+        f"max={cos_sorted[-1]:.6f} max_abs={max_abs:.2e} (n={n})"
     )
     if mean < mean_floor:
         return False, msg + f" — mean below floor {mean_floor}"
     if cmin < min_floor:
         return False, msg + f" — min below floor {min_floor}"
+    if max_abs > abs_floor:
+        return False, msg + f" — max_abs above floor {abs_floor:.2e}"
     return True, msg
 
 
@@ -299,6 +331,106 @@ def gate3_determinism(out_a: Path, out_b: Path, max_docs: int | None, dtype: str
         f"two-run determinism failed: {diffs}/{n} floats differ; "
         f"max abs {max_abs:.2e} > {threshold:.2e}"
     )
+
+
+def _doc_token_view(parsed: dict) -> list[list[tuple[float, ...]]]:
+    """Slice the flat tokens.bin payload into per-doc lists of token vectors.
+
+    Output: docs[i][t] is a tuple-of-floats representing the t-th token
+    of doc i. Used by gate 5 to compute MaxSim scores.
+    """
+    dim = parsed["dim"]
+    offsets = parsed["offsets"]
+    vecs = parsed["vecs"]
+    docs: list[list[tuple[float, ...]]] = []
+    for i in range(parsed["n_docs"]):
+        lo = offsets[i]
+        hi = offsets[i + 1]
+        rows = [tuple(vecs[(lo + t) * dim : (lo + t + 1) * dim]) for t in range(hi - lo)]
+        docs.append(rows)
+    return docs
+
+
+def _maxsim_score(query: list[tuple[float, ...]], doc: list[tuple[float, ...]]) -> float:
+    """ColBERT-style MaxSim: sum_q max_d <q, d>. Inputs are L2-normalised
+    so the dot is the cosine. O(|q| * |d| * dim) — fine on a 100-doc
+    fixture where each query is a 16-token doc."""
+    if not query or not doc:
+        return 0.0
+    total = 0.0
+    for q in query:
+        best = -1e30
+        for dv in doc:
+            s = 0.0
+            for a, b in zip(q, dv):
+                s += a * b
+            if s > best:
+                best = s
+        total += best
+    return total
+
+
+def gate5_search_ranking(
+    pt: dict, mlx: dict, *, n_queries: int, top_k: int, overlap_floor: float
+) -> tuple[bool, str]:
+    """Search-ranking parity.
+
+    Pick the first `n_queries` docs as queries, the rest as the corpus.
+    Compute MaxSim(query, doc) for both PyTorch and MLX outputs and
+    compare the top-k retrieval lists. The two encoders should agree on
+    which docs each query retrieves; a real semantic drift would shuffle
+    the rankings even when per-token cosine still looks ≥ 0.999.
+    """
+    if pt["n_docs"] != mlx["n_docs"] or pt["n_docs"] < n_queries + top_k + 1:
+        return False, (
+            f"corpus too small for n_queries={n_queries}, top_k={top_k}: "
+            f"n_docs pt={pt['n_docs']} mlx={mlx['n_docs']}"
+        )
+
+    pt_docs = _doc_token_view(pt)
+    mlx_docs = _doc_token_view(mlx)
+
+    queries_pt = pt_docs[:n_queries]
+    queries_mlx = mlx_docs[:n_queries]
+    corpus_pt = pt_docs[n_queries:]
+    corpus_mlx = mlx_docs[n_queries:]
+    n_corpus = len(corpus_pt)
+
+    overlaps: list[float] = []
+    pt_top_lists: list[list[int]] = []
+    mlx_top_lists: list[list[int]] = []
+
+    for qi in range(n_queries):
+        q_pt = queries_pt[qi]
+        q_mlx = queries_mlx[qi]
+        scores_pt = [(_maxsim_score(q_pt, corpus_pt[j]), j) for j in range(n_corpus)]
+        scores_mlx = [(_maxsim_score(q_mlx, corpus_mlx[j]), j) for j in range(n_corpus)]
+        # Sort descending by score, tie-break by lower j (stable index order).
+        scores_pt.sort(key=lambda t: (-t[0], t[1]))
+        scores_mlx.sort(key=lambda t: (-t[0], t[1]))
+        top_pt = [j for _, j in scores_pt[:top_k]]
+        top_mlx = [j for _, j in scores_mlx[:top_k]]
+        pt_top_lists.append(top_pt)
+        mlx_top_lists.append(top_mlx)
+        overlap = len(set(top_pt) & set(top_mlx)) / float(top_k)
+        overlaps.append(overlap)
+
+    avg_overlap = sum(overlaps) / len(overlaps)
+    min_overlap = min(overlaps)
+    msg = (
+        f"top-{top_k} overlap on {n_queries} self-queries vs "
+        f"{n_corpus}-doc corpus: avg={avg_overlap:.3f} min={min_overlap:.3f}"
+    )
+    if min_overlap < overlap_floor:
+        # Surface the worst query so a regression is debuggable.
+        worst = overlaps.index(min_overlap)
+        msg += (
+            f" — query[{worst}] overlap {min_overlap:.3f} below floor "
+            f"{overlap_floor:.2f}; pt_top={pt_top_lists[worst]} "
+            f"mlx_top={mlx_top_lists[worst]}"
+        )
+        return False, msg
+    return True, msg
 
 
 def gate4_clustering(pt_bin: Path, mlx_bin: Path, kappa: int, seed: int) -> tuple[bool, str]:
@@ -378,6 +510,31 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="skip downstream cluster-overlap gate (useful when zig build isn't ready)",
     )
+    p.add_argument(
+        "--n-queries",
+        type=int,
+        default=10,
+        help=(
+            "number of leading docs to use as self-queries in gate 5. "
+            "Must satisfy n_queries + top_k + 1 <= n_docs."
+        ),
+    )
+    p.add_argument(
+        "--top-k",
+        type=int,
+        default=10,
+        help="top-k size for gate 5 search-ranking parity",
+    )
+    p.add_argument(
+        "--search-overlap-floor",
+        type=float,
+        default=0.9,
+        help=(
+            "minimum acceptable top-k overlap fraction (per-query, min "
+            "across all queries) for gate 5. 0.9 means at least 9 of 10 "
+            "top-k results must agree between PT and MLX."
+        ),
+    )
     return p.parse_args()
 
 
@@ -415,9 +572,14 @@ def main() -> None:
     results["gate1_token_ids"] = gate1_token_ids(pt, mlx)
     print(f"  {'PASS' if results['gate1_token_ids'][0] else 'FAIL'}: {results['gate1_token_ids'][1]}")
 
-    # Gate 2 thresholds: when we compare fp32 PT vs fp{16,32} MLX the floors are 0.998 mean / 0.99 min.
-    print("[parity] gate 2: per-token cosine")
-    results["gate2_cosine"] = gate2_cosine(pt, mlx, mean_floor=0.998, min_floor=0.99)
+    # Gate 2 thresholds: when we compare fp32 PT vs fp{16,32} MLX the
+    # floors are 0.998 mean / 0.99 min cosine. abs_floor=1e-2 catches
+    # silent magnitude drift while staying loose enough for legitimate
+    # fp16 → fp32 ULP noise on L2-normalised dim-128 vectors.
+    print("[parity] gate 2: per-token cosine + abs-error")
+    results["gate2_cosine"] = gate2_cosine(
+        pt, mlx, mean_floor=0.998, min_floor=0.99, abs_floor=1e-2
+    )
     print(f"  {'PASS' if results['gate2_cosine'][0] else 'FAIL'}: {results['gate2_cosine'][1]}")
 
     print(f"[parity] gate 3: two-run MLX determinism ({args.dtype})")
@@ -434,6 +596,22 @@ def main() -> None:
         except SystemExit as e:
             results["gate4_clustering"] = (False, f"gate4 setup failed: {e}")
         print(f"  {'PASS' if results['gate4_clustering'][0] else 'FAIL'}: {results['gate4_clustering'][1]}")
+
+    print(
+        f"[parity] gate 5: search-ranking top-{args.top_k} overlap "
+        f"({args.n_queries} self-queries)"
+    )
+    results["gate5_search_ranking"] = gate5_search_ranking(
+        pt,
+        mlx,
+        n_queries=args.n_queries,
+        top_k=args.top_k,
+        overlap_floor=args.search_overlap_floor,
+    )
+    print(
+        f"  {'PASS' if results['gate5_search_ranking'][0] else 'FAIL'}: "
+        f"{results['gate5_search_ranking'][1]}"
+    )
 
     print()
     print("[parity] summary:")
