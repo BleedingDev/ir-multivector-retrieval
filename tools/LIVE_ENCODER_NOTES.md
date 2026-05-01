@@ -585,6 +585,99 @@ the GIL for ~10s of ms per batch (8 batches at b=128 on the 1000-doc
 job) and forcing MLX dispatch to wait. Producer thread releases that
 contention, so MLX dispatch saturates more cleanly.
 
+### Rec #7 — `mx.compile` with shape bucketing — **NOT SHIPPED**
+
+Tried wrapping `model.forward` with `mx.compile(_forward_fn, shapeless=True)`
+and a one-warm-batch step at (B=1, T=4) before the timed loop. With
+MLX 0.31.2, the `BertEmbeddings.__call__` body reads
+`T = input_ids.shape[1]` as a Python int and then calls
+`mx.arange(T, dtype=mx.int32)`. Shapeless compile bakes the warm-batch
+T=4 into the traced graph, and the first real batch fails with
+`ValueError: [reshape] Cannot reshape array of size 161280 into shape (1,4,768)`.
+
+The consult predicted this exact failure mode ("`mx.compile` can be
+brittle on Apple Silicon — if it doesn't shapeless-compile cleanly,
+document and skip"). Per-shape compile cache was considered but
+rejected: the sort-by-length path produces a near-unique T per batch
+(~8 distinct shapes on the 1000-doc job), so the compile-cache thrash
+would erase the win. Skipping rec-#7 keeps the simpler call path and
+the rec-#6 producer-thread overlap already does most of what compile
+would help with (eager kernel dispatch from a tight CPU loop).
+
+Reverted — no perf delta to record.
+
+### Rec #8 — fused QKV projection — **NOT SHIPPED**
+
+Concatenated Q/K/V into a single `[3*H, H]` weight at export time and
+ran one fused matmul per attention block (split into Q/K/V along the
+last axis after). Mathematically equivalent to the split path
+(verified offline with random weights: max abs diff = 0.0 at fp32).
+
+Two problems on this hardware (Apple M5 + MLX 0.31.2):
+
+1. **fp16 numerical drift large enough to bump gate 5.** The fused
+   matmul accumulates Q/K/V together and produces slightly different
+   fp16 outputs than three separate matmuls. Per-token cosine min
+   actually improved (0.999825 → 0.999906), but the search-ranking
+   gate (top-10 overlap on 10 self-queries) dropped from
+   avg=1.000 / min=1.000 to **avg=0.990 / min=0.900** — exactly at
+   the configured floor. Same drift was visible at fp32, so this is
+   not just fp16 noise; it's reduction-order divergence at the
+   boundary of the gate.
+2. **Bench regressed, not improved.** The fused weight is 3× the
+   memory footprint of one Q (or K, or V), and the attention path is
+   bandwidth-bound on this hardware, so saving two kernel launches
+   does not pay back the larger memory write. Measured (rec-#6
+   baseline → rec-#8):
+
+   | cell | rec-#6 | rec-#8 (run-1 / run-2) |
+   |---|---:|---:|
+   | 100-doc fp16 b=128         | 2.80s | 6.98s / 2.69s |
+   | 1000-doc fp16 b=128 + sort | 4.19s | 6.05s / 7.74s |
+
+   The 100-doc cell is within noise on the second pass; the 1000-doc
+   cell is consistently worse by 50-100% across two independent
+   bench passes, which is well outside thermal noise.
+
+Reverted both the encoder + exporter changes. Re-exported the weights
+without `qkv.{weight,bias}` keys and without the `fused_qkv` config
+flag; live parity verified back at avg=1.000 / min=1.000 on gate 5.
+
+### Cumulative Wave-2 deltas
+
+Two of the four deferred recs landed (#1 + #6); two reverted (#7 + #8).
+End state vs the post-audit baseline:
+
+| cell                       | post-audit baseline (median / min) | wave-2 end (median / min, run-1) | wave-2 end (median / min, run-2) |
+|----------------------------|-----------------------------------:|---------------------------------:|---------------------------------:|
+| 100-doc fp16 b=128         |                       6.55s / 6.47s |                    2.80s / 2.73s |                    4.08s / 3.09s |
+| 1000-doc fp16 b=128 + sort |                      14.72s / 12.64s |                   4.19s / 4.12s  |                    6.46s / 6.07s |
+
+Two independent post-rec-#8-revert bench passes captured to bracket
+thermal context. The first pass reflects a cool SoC; the second was
+warmer after several fused-QKV bench passes. The min across both
+passes is the honest "what this hardware can do" floor:
+
+| cell                       | best wave-2 min | post-audit min | min-vs-min speedup | min vs PT fp32 cpu |
+|----------------------------|---------------:|---------------:|-------------------:|-------------------:|
+| 100-doc fp16 b=128         |          2.73s |          6.47s |              2.37× | (PT 100-doc 6.83s) → 2.50× |
+| 1000-doc fp16 b=128 + sort |          4.12s |         12.64s |              3.07× | (PT 1000-doc 84.36s) → **20.5×** |
+
+Honest read: the 1000-doc → PT-fp32-cpu speedup tripled (6.33× cool →
+~14× cool / ~20× best-case). Almost all of the win is from rec-#6
+(producer-thread tokenization overlap), not rec-#1; rec-#1 is what
+made rec-#6 possible by making `tokenize_docs` cheap enough to overlap.
+Recs #7 and #8 were honest non-wins on this graph and stack — both
+documented and reverted per the consult's "if it doesn't
+shapeless-compile" / "only ship if measurable" guardrails.
+
+The Recommendation section above understates the Apple-Silicon win
+post-wave-2 — at end-of-wave-2 the encoder is **roughly 14-20×** faster
+than `encode.py` on cpu fp32 for the 1000-doc Jira workload (depending
+on thermal state at the time of measurement), not 5×. Update on the
+next published bench cycle once we have variance bands beyond a single
+bench session.
+
 ## Failure modes worth flagging
 
 - If a future pylate revision breaks the `model.tokenize` →
