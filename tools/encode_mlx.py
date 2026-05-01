@@ -117,11 +117,12 @@ class BertSelfAttention(nn.Module):
         k = self.k(x).reshape(B, T, n, d).transpose(0, 2, 1, 3)
         v = self.v(x).reshape(B, T, n, d).transpose(0, 2, 1, 3)
 
-        # scores [B, n, T, T]
-        scores = (q @ k.transpose(0, 1, 3, 2)) * scale
-        scores = scores + attn_bias  # broadcast [B,1,1,T]
-        attn = mx.softmax(scores, axis=-1)
-        ctx = attn @ v  # [B, n, T, d]
+        # Fused SDPA: softmax internally promotes to fp32, fewer kernel launches
+        # and less memory traffic than the manual q@k.T -> softmax -> @v path.
+        # attn_bias is additive [B,1,1,T] and broadcasts to [B,n,T,T].
+        ctx = mx.fast.scaled_dot_product_attention(
+            q, k, v, scale=scale, mask=attn_bias
+        )  # [B, n, T, d]
         ctx = ctx.transpose(0, 2, 1, 3).reshape(B, T, H)
 
         # output projection + residual + LN (BERT post-LN)
