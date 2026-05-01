@@ -190,6 +190,96 @@ fn msSince(start_ns: u64) f64 {
     return @as(f64, @floatFromInt(nowNs() - start_ns)) / 1e6;
 }
 
+/// Static-chunk parallel for-loop over [0, n_tokens). Each thread runs
+/// `worker(ctx, lo, hi)` for a disjoint chunk. n_threads <= 1 falls
+/// through to a serial call.
+fn parallelTokenLoop(
+    n_threads: u32,
+    n_tokens: u64,
+    comptime worker: anytype,
+    ctx: anytype,
+    gpa: Allocator,
+) !void {
+    if (n_threads <= 1 or n_tokens < 1024) {
+        try worker(ctx, 0, n_tokens);
+        return;
+    }
+    const ChunkErr = struct { e: ?@typeInfo(@typeInfo(@TypeOf(worker)).@"fn".return_type.?).error_union.error_set };
+    const Run = struct {
+        fn run(c: @TypeOf(ctx), lo: u64, hi: u64, out: *ChunkErr) void {
+            worker(c, lo, hi) catch |err| {
+                out.e = err;
+            };
+        }
+    };
+    const T = @min(n_threads, @as(u32, @intCast(n_tokens)));
+    const errs = try gpa.alloc(ChunkErr, T);
+    defer gpa.free(errs);
+    @memset(errs, .{ .e = null });
+
+    const threads = try gpa.alloc(std.Thread, T);
+    defer gpa.free(threads);
+    const chunk = (n_tokens + T - 1) / T;
+    for (0..T) |t| {
+        const lo: u64 = @as(u64, t) * chunk;
+        const hi: u64 = @min(lo + chunk, n_tokens);
+        threads[t] = try std.Thread.spawn(.{}, Run.run, .{ ctx, lo, hi, &errs[t] });
+    }
+    for (threads) |th| th.join();
+    for (errs) |c| if (c.e) |err| return err;
+}
+
+const ResidualsCtx = struct {
+    residuals: []f32,
+    residual_norms: []f32,
+    vectors: []const f32,
+    centroids: []const f32,
+    assignments: []const u32,
+    dim: u32,
+};
+
+fn residualsAndNormsChunk(c: ResidualsCtx, lo: u64, hi: u64) !void {
+    const dim = c.dim;
+    var i = lo;
+    while (i < hi) : (i += 1) {
+        const cid: u32 = c.assignments[@intCast(i)];
+        const v = c.vectors[@intCast(i * @as(u64, dim))..][0..dim];
+        const cent = c.centroids[@as(usize, cid) * dim ..][0..dim];
+        const r = c.residuals[@intCast(i * @as(u64, dim))..][0..dim];
+        var sum_sq: f32 = 0.0;
+        var dd: usize = 0;
+        while (dd < dim) : (dd += 1) {
+            const diff = v[dd] - cent[dd];
+            r[dd] = diff;
+            sum_sq += diff * diff;
+        }
+        const norm: f32 = @sqrt(sum_sq);
+        c.residual_norms[@intCast(i)] = norm;
+        if (norm > 0.0) {
+            const inv: f32 = 1.0 / norm;
+            dd = 0;
+            while (dd < dim) : (dd += 1) r[dd] *= inv;
+        }
+    }
+}
+
+const PqEncodeCtx = struct {
+    pq: *const pq_mod.PQ,
+    residuals: []const f32,
+    pq_codes: []u8,
+    dim: u32,
+};
+
+fn pqEncodeChunk(c: PqEncodeCtx, lo: u64, hi: u64) !void {
+    const dim = c.dim;
+    var i = lo;
+    while (i < hi) : (i += 1) {
+        const r = c.residuals[@intCast(i * @as(u64, dim))..][0..dim];
+        const slot = c.pq_codes[@intCast(i * @as(u64, constants.PQ_M))..][0..constants.PQ_M];
+        try c.pq.encode(r, slot);
+    }
+}
+
 /// In-memory bundle returned by `build`. The caller writes `bytes` to disk
 /// (or hands it to `parse` for a same-process round-trip). All transient
 /// build artefacts are released before return — only the byte image survives.
@@ -255,30 +345,20 @@ pub fn build(
     const residual_norms = try gpa.alloc(f32, @intCast(n_tokens));
     errdefer gpa.free(residual_norms);
 
-    {
-        var i: u64 = 0;
-        while (i < n_tokens) : (i += 1) {
-            const cid: u32 = clu.assignments[@intCast(i)];
-            const v = td.vectors[@intCast(i * @as(u64, dim))..][0..dim];
-            const c = clu.centroids[@as(usize, cid) * dim ..][0..dim];
-            const r = residuals[@intCast(i * @as(u64, dim))..][0..dim];
-            var sum_sq: f32 = 0.0;
-            var dd: usize = 0;
-            while (dd < dim) : (dd += 1) {
-                const diff = v[dd] - c[dd];
-                r[dd] = diff;
-                sum_sq += diff * diff;
-            }
-            const norm: f32 = @sqrt(sum_sq);
-            residual_norms[@intCast(i)] = norm;
-            // Normalise in place — divide-by-zero guard mirrors vec.normalizeInPlace.
-            if (norm > 0.0) {
-                const inv: f32 = 1.0 / norm;
-                dd = 0;
-                while (dd < dim) : (dd += 1) r[dd] *= inv;
-            }
-        }
-    }
+    try parallelTokenLoop(
+        params.n_threads,
+        n_tokens,
+        residualsAndNormsChunk,
+        ResidualsCtx{
+            .residuals = residuals,
+            .residual_norms = residual_norms,
+            .vectors = td.vectors,
+            .centroids = clu.centroids,
+            .assignments = clu.assignments,
+            .dim = dim,
+        },
+        gpa,
+    );
     if (verbose) std.debug.print("    [stage] residuals + norms: {d:8.1} ms\n", .{msSince(t2_0)});
 
     // ---- 3. PQ training (paper §4). ----
@@ -292,14 +372,18 @@ pub fn build(
     const total_codes: u64 = n_tokens * @as(u64, constants.PQ_M);
     const pq_codes = try gpa.alloc(u8, @intCast(total_codes));
     errdefer gpa.free(pq_codes);
-    {
-        var i: u64 = 0;
-        while (i < n_tokens) : (i += 1) {
-            const r = residuals[@intCast(i * @as(u64, dim))..][0..dim];
-            const slot = pq_codes[@intCast(i * @as(u64, constants.PQ_M))..][0..constants.PQ_M];
-            try pq.encode(r, slot);
-        }
-    }
+    try parallelTokenLoop(
+        params.n_threads,
+        n_tokens,
+        pqEncodeChunk,
+        PqEncodeCtx{
+            .pq = &pq,
+            .residuals = residuals,
+            .pq_codes = pq_codes,
+            .dim = dim,
+        },
+        gpa,
+    );
     if (verbose) std.debug.print("    [stage] pq.encode:         {d:8.1} ms\n", .{msSince(t4_0)});
 
     // ---- 5. HNSW over (re-normalised) centroids (paper §4 + §11). ----
