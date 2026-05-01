@@ -52,9 +52,12 @@ pub inline fn dot(a: []const f32, b: []const f32) VecError!f32 {
 /// reduction loop fully unrolls, the tail branch disappears, and LLVM is free
 /// to schedule the lanes across multiple FMA pipes.
 ///
-/// Caller must guarantee `a.len == b.len == dim`; this is a private helper
-/// reached only via the `dot` dispatcher (which has already validated lengths).
-pub inline fn dotComptime(comptime dim: u32, a: []const f32, b: []const f32) f32 {
+/// Private — reachable from the `dot` dispatcher (which has already validated
+/// `a.len == b.len == dim`) and from same-file parity tests. Boundary check
+/// is `std.debug.assert`, which is a no-op in ReleaseFast; making this
+/// non-`pub` keeps that contract enforceable since no out-of-file caller
+/// can pass mismatched lengths.
+inline fn dotComptime(comptime dim: u32, a: []const f32, b: []const f32) f32 {
     std.debug.assert(a.len == dim and b.len == dim);
 
     if (dim == 0) return 0.0;
@@ -120,9 +123,9 @@ pub inline fn l2sq(a: []const f32, b: []const f32) VecError!f32 {
     };
 }
 
-/// Comptime-specialized squared L2 distance. See `dotComptime` for the
-/// register/unroll strategy.
-pub inline fn l2sqComptime(comptime dim: u32, a: []const f32, b: []const f32) f32 {
+/// Comptime-specialized squared L2 distance. Private; see `dotComptime`
+/// for the register/unroll strategy and the rationale for non-`pub`.
+inline fn l2sqComptime(comptime dim: u32, a: []const f32, b: []const f32) f32 {
     std.debug.assert(a.len == dim and b.len == dim);
 
     if (dim == 0) return 0.0;
@@ -186,8 +189,8 @@ pub inline fn normalizeInPlace(v: []f32) VecError!void {
     }
 }
 
-/// Comptime-specialized in-place normalize.
-pub inline fn normalizeComptime(comptime dim: u32, v: []f32) void {
+/// Comptime-specialized in-place normalize. Private; see `dotComptime`.
+inline fn normalizeComptime(comptime dim: u32, v: []f32) void {
     std.debug.assert(v.len == dim);
     if (dim == 0) return;
 
@@ -555,10 +558,11 @@ test "plan-11 parity: dot dim=128 ramp + permutation" {
     }
     const ref = scalarDotRef(&a, &b);
     const got = try dot(&a, &b);
-    // dim=128 has wider FMA reduction depth — relax to 1e-4 for the cumulative
-    // floating-point reordering between scalar reference and the @Vector(16)
-    // tree-reduce. Still well below any algorithmic-meaningful tolerance.
-    try testing.expectApproxEqAbs(ref, got, 1e-4);
+    // dim=128 reduces 32 chunks of @Vector(4,f32) — the tree reduction order
+    // differs from the scalar reference left-fold, so the LSBs drift. 1e-5
+    // is tight enough to catch real algorithmic bugs (the result is O(1));
+    // anything below ~3e-6 starts failing on legitimate FMA reordering.
+    try testing.expectApproxEqAbs(ref, got, 1e-5);
     try testing.expectApproxEqAbs(got, try dot(&b, &a), 1e-5);
     try testing.expectApproxEqAbs(got, dotComptime(128, &a, &b), 1e-5);
 }
@@ -572,7 +576,8 @@ test "plan-11 parity: l2sq dim=128 ramp + permutation" {
     }
     const ref = scalarL2sqRef(&a, &b);
     const got = try l2sq(&a, &b);
-    try testing.expectApproxEqAbs(ref, got, 1e-4);
+    // See dot-dim=128 parity test for the 1e-5 reasoning.
+    try testing.expectApproxEqAbs(ref, got, 1e-5);
     try testing.expectApproxEqAbs(got, try l2sq(&b, &a), 1e-5);
     try testing.expectApproxEqAbs(got, l2sqComptime(128, &a, &b), 1e-5);
 }

@@ -208,6 +208,89 @@ fn benchKmeansAssign(allocator: Allocator, comptime label: []const u8, dim: usiz
     return .{ .name = label, .dim = dim, .iters = n_points, .ns_per_op = ns_per_op, .gflops = gflops };
 }
 
+/// Mirrors pq.encode's exact call shape: l2sq(sub, codebook[m, c]) with
+/// `sub_dim` read from a struct field (not a stack-local). Tests whether
+/// plan-11's `pub inline fn` dispatcher is enough or if we need exact-dim
+/// helpers exposed for callers that hold dim in a runtime field.
+const MockPQ = struct {
+    sub_dim: u32,
+    codebook: []const f32,
+};
+
+fn benchPqEncodePattern(allocator: Allocator, comptime label: []const u8, sub_dim: u32, n_subspaces: usize, n_centroids: usize, n_tokens: usize) !Row {
+    const dim = @as(usize, sub_dim) * n_subspaces;
+    const cb_len = @as(usize, sub_dim) * n_centroids * n_subspaces;
+    const codebook = try allocator.alloc(f32, cb_len);
+    defer allocator.free(codebook);
+    for (codebook, 0..) |*x, i| x.* = @sin(@as(f32, @floatFromInt(i)) * 0.011);
+    const residuals = try allocator.alloc(f32, dim * n_tokens);
+    defer allocator.free(residuals);
+    for (residuals, 0..) |*x, i| x.* = @cos(@as(f32, @floatFromInt(i)) * 0.013);
+
+    const pq = MockPQ{ .sub_dim = sub_dim, .codebook = codebook };
+    // Indirection through a heap pointer mirrors `*const PQ` in pq.zig:59.
+    const pq_ptr: *const MockPQ = &pq;
+
+    var warm_sink: usize = 0;
+    {
+        var t: usize = 0;
+        while (t < n_tokens / 100 + 1) : (t += 1) {
+            const r = residuals[t * dim ..][0..dim];
+            var m: usize = 0;
+            while (m < n_subspaces) : (m += 1) {
+                const sub = r[m * pq_ptr.sub_dim ..][0..pq_ptr.sub_dim];
+                var best_c: usize = 0;
+                var best_d: f32 = std.math.inf(f32);
+                var c: usize = 0;
+                while (c < n_centroids) : (c += 1) {
+                    const cb_base = ((m * n_centroids) + c) * pq_ptr.sub_dim;
+                    const cb = pq_ptr.codebook[cb_base..][0..pq_ptr.sub_dim];
+                    const d = try vec.l2sq(sub, cb);
+                    if (d < best_d) {
+                        best_d = d;
+                        best_c = c;
+                    }
+                }
+                warm_sink +%= best_c;
+            }
+        }
+    }
+    std.mem.doNotOptimizeAway(warm_sink);
+
+    const t0 = nowNs();
+    var sink: usize = 0;
+    var t: usize = 0;
+    while (t < n_tokens) : (t += 1) {
+        const r = residuals[t * dim ..][0..dim];
+        var m: usize = 0;
+        while (m < n_subspaces) : (m += 1) {
+            const sub = r[m * pq_ptr.sub_dim ..][0..pq_ptr.sub_dim];
+            var best_c: usize = 0;
+            var best_d: f32 = std.math.inf(f32);
+            var c: usize = 0;
+            while (c < n_centroids) : (c += 1) {
+                const cb_base = ((m * n_centroids) + c) * pq_ptr.sub_dim;
+                const cb = pq_ptr.codebook[cb_base..][0..pq_ptr.sub_dim];
+                const d = try vec.l2sq(sub, cb);
+                if (d < best_d) {
+                    best_d = d;
+                    best_c = c;
+                }
+            }
+            sink +%= best_c;
+        }
+    }
+    const ns: u64 = nowNs() - t0;
+    std.mem.doNotOptimizeAway(sink);
+
+    const ns_per_op = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(n_tokens));
+    const flops_per_op = @as(f64, @floatFromInt(n_subspaces)) *
+        @as(f64, @floatFromInt(n_centroids)) *
+        3.0 * @as(f64, @floatFromInt(sub_dim));
+    const gflops = flops_per_op / ns_per_op;
+    return .{ .name = label, .dim = sub_dim, .iters = n_tokens, .ns_per_op = ns_per_op, .gflops = gflops };
+}
+
 pub fn main() !void {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();
@@ -247,4 +330,99 @@ pub fn main() !void {
     printRow(try benchKmeansAssign(a, "assign k=256", 4, 256, 5_000)); // PQ subspace
     printRow(try benchKmeansAssign(a, "assign k=256", 64, 256, 1_000)); // jina-colbert
     printRow(try benchKmeansAssign(a, "assign k=256", 128, 256, 1_000)); // ColBERTv2
+
+    // pq.encode pattern: M=32 subspaces × 256 centroids × per-token l2sq with
+    // `sub_dim` from a struct field. Plan-11 follow-up: tests if the runtime
+    // sub_dim through a `*const PQ` pointer breaks the inline-dispatcher's
+    // ability to constant-fold the switch.
+    std.debug.print("\npq.encode pattern (M=32, 256 centroids, runtime sub_dim from struct field):\n", .{});
+    printRow(try benchPqEncodePattern(a, "pq.encode", 2, 32, 256, 2_000)); // jina-colbert-v2-64
+    printRow(try benchPqEncodePattern(a, "pq.encode", 4, 32, 256, 2_000)); // ColBERTv2.0
+
+    // pq.encode pattern with the dispatch HOISTED: branch ONCE on sub_dim
+    // outside the (m, c) loops and call comptime-known l2sq. Upper-bound on
+    // what finding #3 could buy us if pq.zig adopted exact-dim helpers.
+    std.debug.print("\npq.encode pattern (dispatch hoisted to outer level):\n", .{});
+    printRow(try benchPqEncodePatternHoisted(a, "pq.encode-h", 2, 32, 256, 2_000));
+    printRow(try benchPqEncodePatternHoisted(a, "pq.encode-h", 4, 32, 256, 2_000));
+}
+
+/// Counterfactual: same workload as benchPqEncodePattern, but the sub_dim
+/// switch is hoisted to the outer level. Mirrors what pq.zig would look like
+/// if finding #3 were implemented (one runtime branch per token, then exact-
+/// dim l2sq inside the inner loop).
+fn benchPqEncodePatternHoisted(allocator: Allocator, comptime label: []const u8, sub_dim: u32, n_subspaces: usize, n_centroids: usize, n_tokens: usize) !Row {
+    const dim = @as(usize, sub_dim) * n_subspaces;
+    const cb_len = @as(usize, sub_dim) * n_centroids * n_subspaces;
+    const codebook = try allocator.alloc(f32, cb_len);
+    defer allocator.free(codebook);
+    for (codebook, 0..) |*x, i| x.* = @sin(@as(f32, @floatFromInt(i)) * 0.011);
+    const residuals = try allocator.alloc(f32, dim * n_tokens);
+    defer allocator.free(residuals);
+    for (residuals, 0..) |*x, i| x.* = @cos(@as(f32, @floatFromInt(i)) * 0.013);
+
+    const pq = MockPQ{ .sub_dim = sub_dim, .codebook = codebook };
+    const pq_ptr: *const MockPQ = &pq;
+
+    // Warm-up + timed phase share a closure that branches once on sub_dim.
+    const Inner = struct {
+        fn run(comptime sd: u32, _pq: *const MockPQ, _r: []const f32, _ns: usize, _nc: usize) !usize {
+            var sink: usize = 0;
+            var t: usize = 0;
+            const _dim = @as(usize, sd) * _ns;
+            while (t < _r.len / _dim) : (t += 1) {
+                const r = _r[t * _dim ..][0.._dim];
+                var m: usize = 0;
+                while (m < _ns) : (m += 1) {
+                    const sub = r[m * sd ..][0..sd];
+                    var best_c: usize = 0;
+                    var best_d: f32 = std.math.inf(f32);
+                    var c: usize = 0;
+                    while (c < _nc) : (c += 1) {
+                        const cb_base = ((m * _nc) + c) * sd;
+                        const cb = _pq.codebook[cb_base..][0..sd];
+                        // Public `vec.l2sq` here — but the slice length is
+                        // built from comptime `sd`, so the inline dispatcher's
+                        // switch folds at compile time. Same end-state as
+                        // calling a hypothetical exact-dim helper.
+                        const d = try vec.l2sq(sub, cb);
+                        if (d < best_d) {
+                            best_d = d;
+                            best_c = c;
+                        }
+                    }
+                    sink +%= best_c;
+                }
+            }
+            return sink;
+        }
+    };
+
+    // Warm-up
+    var warm: usize = 0;
+    if (pq_ptr.sub_dim == 2) {
+        warm = try Inner.run(2, pq_ptr, residuals[0..dim], n_subspaces, n_centroids);
+    } else if (pq_ptr.sub_dim == 4) {
+        warm = try Inner.run(4, pq_ptr, residuals[0..dim], n_subspaces, n_centroids);
+    }
+    std.mem.doNotOptimizeAway(warm);
+
+    const t0 = nowNs();
+    var sink: usize = 0;
+    if (pq_ptr.sub_dim == 2) {
+        sink = try Inner.run(2, pq_ptr, residuals, n_subspaces, n_centroids);
+    } else if (pq_ptr.sub_dim == 4) {
+        sink = try Inner.run(4, pq_ptr, residuals, n_subspaces, n_centroids);
+    } else {
+        unreachable;
+    }
+    const ns: u64 = nowNs() - t0;
+    std.mem.doNotOptimizeAway(sink);
+
+    const ns_per_op = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(n_tokens));
+    const flops_per_op = @as(f64, @floatFromInt(n_subspaces)) *
+        @as(f64, @floatFromInt(n_centroids)) *
+        3.0 * @as(f64, @floatFromInt(sub_dim));
+    const gflops = flops_per_op / ns_per_op;
+    return .{ .name = label, .dim = sub_dim, .iters = n_tokens, .ns_per_op = ns_per_op, .gflops = gflops };
 }
