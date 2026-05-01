@@ -1,8 +1,11 @@
 # Benchmarks (paper §7, §8 reproduction)
 
-Owned by the **retriever** teammate. These executables are wired by the lead into
-`build.zig` as separate test/run steps once #20 is unblocked; until then the
-files here are scaffolding.
+Owned by the **retriever** teammate. The reusable sweep core lives in
+`src/retrieval/bench.zig` and is exercised on every `zig build test` via a
+synthetic-fixture smoke harness. The per-dataset entry points in this
+directory are thin executables that load real on-disk data and call into
+`tac.retrieval.bench.runSweep`; they're not part of the default `zig build
+test` pipeline because they depend on multi-GB encoded corpora.
 
 ## Target operating points (paper Table 1)
 
@@ -13,23 +16,21 @@ files here are scaffolding.
 | LoTTE-pooled  | Success@5 = 67.5 | 11 ms           | match within margin |
 
 Latency is single-core wall-clock (paper §9). We pin to one core via
-`tac.eval.latency.pinToCore`.
+`tac.eval.latency.pinToCore` (best-effort per OS).
 
 ## Layout
 
 ```
+src/retrieval/bench.zig    — reusable sweep core (paper §6 grid). All test
+                             coverage lives here; imports search/refine/etc.
+
 benchmarks/
-  README.md                 — this file
-  msmarco_v1.zig            — MS MARCO-v1 harness (sweep κ_c × κ_d × α)
-  lotte_pooled.zig          — LoTTE-pooled harness
-  common/
-    qrels.zig               — qrels file parsers (TREC/MS MARCO formats)
-    queries.zig             — encoded query loader (.bin + sidecar)
-    sweep.zig               — grid sweep driver: emits CSV per (κ_c, κ_d, α)
-  results/
-    YYYY-MM-DD-msmarco.csv  — one row per operating point
+  README.md                — this file
+  msmarco_v1.zig           — MS MARCO-v1 harness entry (executable)
+  lotte_pooled.zig         — LoTTE-pooled harness entry (executable)
+  results/                 — written CSVs, untracked (.gitignore)
+    YYYY-MM-DD-msmarco.csv
     YYYY-MM-DD-lotte.csv
-    README.md               — how to read the CSVs
 ```
 
 ## Sweep grid (paper §6)
@@ -38,20 +39,34 @@ benchmarks/
 - `κ_d ∈ {250, 500, 1000, 2000, 4000}`
 - `α ∈ {null, 0.35, 0.40, 0.45, 0.50}`  (null = top-κ_d only)
 
-Total cells: 6 × 5 × 5 = 150 per dataset. Each cell runs all queries (6,980 for
-MS MARCO-v1 dev.small, 2,931 for LoTTE search/dev) and reports
-(MRR@10 or Success@5, avg latency, p50, p95).
+Total cells: 6 × 5 × 5 = 150 per dataset.
 
 ## CSV schema
 
 ```
-dataset,kappa_c,kappa_d,alpha,n_queries,quality,avg_total_ms,p50_total_ms,p95_total_ms,avg_gather_ms,avg_prune_ms,avg_table_ms,avg_refine_ms,git_sha,host
+dataset,kappa_c,kappa_d,alpha_x100,n_queries,quality,avg_total_ms,p50_total_ms,p95_total_ms,avg_gather_ms,avg_prune_ms,avg_table_ms,avg_refine_ms,git_sha
 ```
 
-## Inputs (not in repo)
+`alpha_x100` is `round(alpha · 100)` or `-1` for the no-CP cell.
 
-The harnesses expect:
-- `<dataset>.tac.idx` — built via `tac index ...` (lead-owned CLI; once #15 lands).
-- `<dataset>.queries.bin` + `.qrels.tsv` — produced by `tools/encode.py` (#5).
+## How to run a real-data sweep
 
-A synthetic 100-doc smoke harness will live alongside the real ones for CI.
+1. Encode the corpus into `tokens.bin` via `tools/encode.py`. See
+   `tools/LIVE_ENCODER_NOTES.md` for the ColBERTv2 setup.
+2. Encode the queries into a separate `queries.bin` (same format) and load
+   qrels.tsv (TREC format).
+3. Build the index: `zig build run -Doptimize=ReleaseFast -- index <tokens.bin> <out.tac>`
+   (CLI to be wired by lead).
+4. Run the harness: `zig build run-bench-msmarco -Doptimize=ReleaseFast -- \
+       --index <out.tac> --queries <queries.bin> --qrels <qrels.tsv> \
+       --out benchmarks/results/msmarco-$(date +%Y%m%d).csv`
+
+Step 4 is gated on `b.addExecutable` blocks in `build.zig` (lead-owned).
+
+## CI smoke
+
+`zig build test` runs `bench.test "bench: end-to-end smoke ..."` which builds a
+100-doc synthetic fixture and runs a single sweep cell, asserting the CSV
+schema, latency report finite-ness, and quality range. Real-data cells are
+not part of CI — running 150 cells × 6,980 queries × MS MARCO scale needs
+hours of single-core compute and is a separate operational task.

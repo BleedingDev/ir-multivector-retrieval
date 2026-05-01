@@ -1,28 +1,11 @@
-//! benchmarks/msmarco_v1.zig — MS MARCO-v1 (dev.small) harness entry.
+//! benchmarks/lotte_pooled.zig — LoTTE-pooled (search/dev) harness entry.
 //!
-//! Owner: retriever. Target operating points (paper Table 1):
-//!   - MRR@10 = 39.0 → 10 ms/query
-//!   - MRR@10 = 39.3 → 14 ms/query
+//! Owner: retriever. Target operating point (paper Table 1):
+//!   - Success@5 = 67.5 → 11 ms/query
 //!
-//! Single-thread (paper §9). Sweeps κ_c × κ_d × α over the paper's grid via
-//! `tac.retrieval.bench.runSweep`, writing one CSV row per cell.
-//!
-//! Wiring: not part of `zig build test`. To produce Table 1 numbers the lead
-//! adds an executable step in build.zig:
-//!
-//!   const bench_msmarco = b.addExecutable(.{
-//!       .name = "bench_msmarco",
-//!       .root_source_file = b.path("benchmarks/msmarco_v1.zig"),
-//!       .target = target, .optimize = .ReleaseFast,
-//!   });
-//!   bench_msmarco.root_module.addImport("tac", lib_mod);
-//!
-//! Usage (post-wiring):
-//!   zig build bench_msmarco -Doptimize=ReleaseFast -- \
-//!     --index   <path/to/msmarco.tac> \
-//!     --queries <path/to/queries.bin> \
-//!     --qrels   <path/to/qrels.tsv>   \
-//!     --out     benchmarks/results/msmarco-$(date +%Y%m%d).csv
+//! Same shape as msmarco_v1.zig, but uses Success@5 as the metric. See
+//! benchmarks/README.md for the runbook and `src/retrieval/bench.zig` for
+//! the sweep core.
 
 const std = @import("std");
 const tac = @import("tac");
@@ -68,10 +51,10 @@ fn parseArgs(gpa: std.mem.Allocator) !Args {
         args.qrels_path.len == 0 or args.out_path.len == 0)
     {
         std.debug.print(
-            \\msmarco_v1: missing required args.
+            \\lotte_pooled: missing required args.
             \\  --index PATH    serialised .tac index file
             \\  --queries PATH  encoded queries.bin (token_dump format)
-            \\  --qrels PATH    qrels.tsv (qid<TAB>iter<TAB>doc_id<TAB>rel)
+            \\  --qrels PATH    qrels.tsv
             \\  --out PATH      output CSV
             \\
         , .{});
@@ -93,13 +76,8 @@ pub fn main() !void {
         gpa.free(args.out_path);
     }
 
-    // The actual data-loading layer (mmap index, decode queries.bin, parse
-    // qrels.tsv) is out of scope for this scaffolding — that wiring lives
-    // alongside `tools/encode.py` in a future operational task. Today this
-    // executable verifies the CLI surface and returns a clear error so a
-    // batch script can detect "harness present but corpus not yet built".
     std.debug.print(
-        \\msmarco_v1 harness: parsed args.
+        \\lotte_pooled harness: parsed args.
         \\  index   = {s}
         \\  queries = {s}
         \\  qrels   = {s}
@@ -111,13 +89,8 @@ pub fn main() !void {
         \\
     , .{ args.index_path, args.queries_path, args.qrels_path, args.out_path });
 
-    // Touch the public sweep API symbols so the linker pulls them in and a
-    // future data-runtime task can replace this stub without re-discovering
-    // the surface.
     _ = tac.retrieval.bench.kappa_c_grid;
-    _ = tac.retrieval.bench.kappa_d_grid;
     _ = tac.retrieval.bench.alpha_grid;
-    _ = tac.retrieval.bench.csv_header;
 
     return error.NotImplemented;
 }
