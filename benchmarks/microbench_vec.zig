@@ -292,11 +292,20 @@ fn benchPqEncodePattern(allocator: Allocator, comptime label: []const u8, sub_di
 }
 
 pub fn main() !void {
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa_state.deinit();
-    const a = gpa_state.allocator();
+    // SmpAllocator: thread-safe, no leak-checking overhead. DebugAllocator
+    // skews kernel-level timings — see L10 in audit-fixes-master-plan.md.
+    const a = std.heap.smp_allocator;
 
-    std.debug.print("microbench_vec — kernel timings (lane_count = {d})\n\n", .{vec.lane_count});
+    // Self-describing header so stdout captures everything needed to
+    // reproduce a number: allocator, optimize mode, timer source, lane count.
+    std.debug.print(
+        "microbench_vec — kernel timings\n" ++
+            "  protocol: allocator=smp_allocator timer=clock_gettime(CLOCK_MONOTONIC)\n" ++
+            "            optimize={s} lane_count={d}\n" ++
+            "            warm-up: iters/100 in-loop (per kernel); no inter-bench cooldown\n" ++
+            "            macOS thread affinity is a no-op; rely on QoS + a quiet machine\n\n",
+        .{ @tagName(@import("builtin").mode), vec.lane_count },
+    );
 
     // dim=2 / dim=4 are PQ subspaces; called *very* often but each call is tiny.
     // Use higher iter count.

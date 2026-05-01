@@ -26,8 +26,30 @@ pub const RunArgs = struct {
     /// rel >= min_rel ⇒ relevant.
     min_rel: i32 = 1,
     /// Pin the benchmark thread to this core (paper §9). Best-effort per OS.
-    pin_core: ?u32 = 0,
+    /// Set to null on macOS — `pinToCore` is a no-op there (Mach
+    /// `thread_policy_set` isn't surfaced in std), so leaving it 0 implied
+    /// a guarantee we don't have. Linux still pins via `sched_setaffinity`.
+    pin_core: ?u32 = null,
 };
+
+/// Read `BENCH_WARMUP` (count) and `BENCH_COOLDOWN_MS` (ms) from the
+/// process environment to build a `BenchProtocol`. Falls back to defaults
+/// when unset or unparseable, so production runs need no env at all but a
+/// CI hostile-machine run can dial up cooldown without recompiling.
+pub fn protocolFromEnv(environ: std.process.Environ) tac.retrieval.bench.BenchProtocol {
+    var p = tac.retrieval.bench.BenchProtocol{};
+    if (environ.getPosix("BENCH_WARMUP")) |v| {
+        if (std.fmt.parseInt(u32, v, 10)) |n| {
+            p.warmup_iters = n;
+        } else |_| {}
+    }
+    if (environ.getPosix("BENCH_COOLDOWN_MS")) |v| {
+        if (std.fmt.parseInt(u64, v, 10)) |ms| {
+            p.cooldown_ns = ms * 1_000_000;
+        } else |_| {}
+    }
+    return p;
+}
 
 const CsvCtx = struct {
     writer: *std.Io.Writer,
@@ -64,8 +86,10 @@ fn slurp(io: std.Io, dir: std.Io.Dir, path: []const u8, gpa: Allocator, comptime
 }
 
 /// End-to-end harness: open inputs, fold them into a `bench.QueryPack`, run
-/// the paper §6 grid sweep, write a CSV.
-pub fn runDatasetSweep(args: RunArgs, gpa: Allocator) !void {
+/// the paper §6 grid sweep, write a CSV. Prints the bench protocol header
+/// to stderr and to the CSV before the sweep so the captured output is
+/// self-describing.
+pub fn runDatasetSweep(args: RunArgs, protocol: tac.retrieval.bench.BenchProtocol, gpa: Allocator) !void {
     if (args.pin_core) |c| tac.eval.latency.pinToCore(c);
 
     var threaded = std.Io.Threaded.init(gpa, .{});
@@ -148,6 +172,18 @@ pub fn runDatasetSweep(args: RunArgs, gpa: Allocator) !void {
     var write_buf: [16 * 1024]u8 = undefined;
     var fw = out_file.writer(io, &write_buf);
     var w = &fw.interface;
+
+    // Self-describing header — emitted to stderr (so the human running the
+    // bench sees it live) and as `#`-prefixed comments in the CSV (so the
+    // captured artifact remembers what produced it). stderr path goes
+    // through a fixed buffer + `std.debug.print` to avoid threading an Io
+    // instance through `std.Io.File.stderr().writer`.
+    var hdr_buf: [4 * 1024]u8 = undefined;
+    var hdr_w = std.Io.Writer.fixed(&hdr_buf);
+    try tac.retrieval.bench.writeProtocolHeader(&hdr_w, args.dataset, args.git_sha, pack_n_q.items.len, args.metric, protocol);
+    std.debug.print("{s}", .{hdr_w.buffered()});
+    try tac.retrieval.bench.writeProtocolHeader(w, args.dataset, args.git_sha, pack_n_q.items.len, args.metric, protocol);
+
     try w.writeAll(tac.retrieval.bench.csv_header);
     try w.writeByte('\n');
 
@@ -157,6 +193,6 @@ pub fn runDatasetSweep(args: RunArgs, gpa: Allocator) !void {
         .git_sha = args.git_sha,
     };
 
-    try tac.retrieval.bench.runSweep(&index, pack, args.metric, writeRowCallback, &ctx, gpa);
+    try tac.retrieval.bench.runSweepWithProtocol(&index, pack, args.metric, protocol, writeRowCallback, &ctx, gpa);
     try w.flush();
 }

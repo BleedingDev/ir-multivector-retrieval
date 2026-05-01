@@ -20,22 +20,21 @@
 //!   pub fn pinToCore(core: u32) void;        // best-effort no-op on unsupported OS
 //!
 //! ---------------------------------------------------------------------------
-//! DESIGN PSEUDOCODE for timeQuery (waits on retrieval.search — task #19):
+//! DESIGN PSEUDOCODE for timeQuery (implemented inline in retrieval/bench.zig):
 //!
 //! timeQuery(index, pq, query_tokens, n_q, params, gpa) -> StageTimings:
 //!   var t = StageTimings{};
-//!   var timer = std.time.Timer.start();
-//!   candidates = gather.gather(...);    t.gather_ns = timer.lap();
-//!   survivors  = prune.prune(...);      t.prune_ns  = timer.lap();
-//!   pq.buildDistanceTable(...);         t.table_build_ns = timer.lap();
-//!   for s in survivors: refine.refine(...); t.refine_ns = timer.lap();
+//!   var sw = Stopwatch.start();          // clock_gettime(CLOCK_MONOTONIC)
+//!   candidates = gather.gather(...);     t.gather_ns = sw.lap();
+//!   survivors  = prune.prune(...);       t.prune_ns  = sw.lap();
+//!   pq.buildDistanceTable(...);          t.table_build_ns = sw.lap();
+//!   for s in survivors: refine.refine(...); t.refine_ns = sw.lap();
 //!   t.total_ns = t.gather_ns + t.prune_ns + t.table_build_ns + t.refine_ns;
 //!   return t;
 //!
 //! pinToCore(core):
 //!   builtin.os.tag == .linux: sched_setaffinity(0, [1u << core])
-//!   builtin.os.tag == .macos: thread_policy_set THREAD_AFFINITY_POLICY (best-effort)
-//!   else:                     no-op
+//!   else (incl. macOS):       no-op (see fn doc)
 //! ---------------------------------------------------------------------------
 
 const std = @import("std");
@@ -45,8 +44,12 @@ const builtin = @import("builtin");
 /// retrieval as single-core wall clock).
 ///
 /// - Linux: `sched_setaffinity(0, [1u << core])` on a singleton CPU set.
-/// - macOS: thread_policy_set with THREAD_AFFINITY_POLICY (Apple Silicon
-///   ignores real affinity; the tag still groups co-scheduled threads).
+/// - macOS: **no-op**. Mach `thread_policy_set(THREAD_AFFINITY_POLICY)`
+///   isn't surfaced through std, and on Apple Silicon real affinity is not
+///   honored anyway (the OS schedules across P/E cores by QoS, not by
+///   affinity tag). To honestly bench on macOS, run on a quiet machine,
+///   plug in power, and rely on `BENCH_COOLDOWN_MS` between cells. Don't
+///   claim core-pinning in headline numbers.
 /// - Other OS: no-op.
 ///
 /// Errors are swallowed — pinning is best-effort; benchmark numbers are

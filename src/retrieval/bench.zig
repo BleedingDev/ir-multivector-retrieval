@@ -208,9 +208,99 @@ pub const kappa_c_grid: []const u32 = &.{ 15, 20, 40, 80, 100, 120 };
 pub const kappa_d_grid: []const u32 = &.{ 250, 500, 1000, 2000, 4000 };
 pub const alpha_grid: []const ?f32 = &.{ null, 0.35, 0.40, 0.45, 0.50 };
 
+/// Bench harness discipline. Captured in the run header so each set of
+/// numbers carries the protocol that produced them.
+///
+/// - `warmup_iters`: how many warm-up cells to run before the timed sweep.
+///   Each warm-up cell uses `(kappa_c=80, kappa_d=1000, alpha=null)` — the
+///   middle of the paper grid — and its results are discarded. Defaults to
+///   1; set 0 to disable. Warm-up populates allocator pools, exercises code
+///   paths, and lets the CPU hit a stable frequency before measurement.
+/// - `cooldown_ns`: nanoseconds to sleep between timed cells via
+///   `nanosleep(2)`. Lets CPU temperature recover so adjacent cells don't
+///   contaminate one another. Defaults to 0; configure via `BENCH_COOLDOWN_MS`.
+/// - `allocator_label`, `timer_label`: free-form strings emitted in the
+///   header so output is self-describing.
+pub const BenchProtocol = struct {
+    warmup_iters: u32 = 1,
+    cooldown_ns: u64 = 0,
+    allocator_label: []const u8 = "smp_allocator",
+    timer_label: []const u8 = "clock_gettime(CLOCK_MONOTONIC)",
+};
+
+/// Sleep for `ns` nanoseconds via `nanosleep(2)`. Returns even on EINTR.
+/// Used between cells for thermal cooldown; not in the timed path.
+fn sleepNs(ns: u64) void {
+    if (ns == 0) return;
+    var req: std.c.timespec = .{
+        .sec = @intCast(ns / 1_000_000_000),
+        .nsec = @intCast(ns % 1_000_000_000),
+    };
+    var rem: std.c.timespec = undefined;
+    while (std.c.nanosleep(&req, &rem) == -1) {
+        // EINTR: continue with remainder. Anything else: bail (best-effort).
+        const errno = std.c._errno().*;
+        if (errno != @intFromEnum(std.c.E.INTR)) return;
+        req = rem;
+    }
+}
+
+/// Print a self-describing protocol header to `writer`. Captures everything
+/// needed to reproduce a number: dataset, git_sha, allocator, timer, warm-up
+/// + cooldown configuration. Per finding L10: headline numbers must be
+/// reproducible from a single command + commit + allocator + warm-up
+/// protocol that's printed at the top of the run.
+pub fn writeProtocolHeader(
+    writer: *std.Io.Writer,
+    dataset: []const u8,
+    git_sha: []const u8,
+    n_queries: usize,
+    metric: MetricKind,
+    protocol: BenchProtocol,
+) std.Io.Writer.Error!void {
+    const builtin = @import("builtin");
+    const cooldown_ms = protocol.cooldown_ns / 1_000_000;
+    try writer.print(
+        "# bench protocol\n" ++
+            "#   dataset       = {s}\n" ++
+            "#   git_sha       = {s}\n" ++
+            "#   metric        = {s}\n" ++
+            "#   n_queries     = {d}\n" ++
+            "#   sweep_cells   = {d} (κ_c × κ_d × α grid, paper §6)\n" ++
+            "#   allocator     = {s}\n" ++
+            "#   timer         = {s}\n" ++
+            "#   warmup_iters  = {d}  (cells discarded before timed sweep)\n" ++
+            "#   cooldown_ms   = {d}  (sleep between timed cells)\n" ++
+            "#   optimize      = {s}\n" ++
+            "#   target_os     = {s}\n" ++
+            "#   thread_pin    = {s}\n",
+        .{
+            dataset,
+            git_sha,
+            @tagName(metric),
+            n_queries,
+            kappa_c_grid.len * kappa_d_grid.len * alpha_grid.len,
+            protocol.allocator_label,
+            protocol.timer_label,
+            protocol.warmup_iters,
+            cooldown_ms,
+            @tagName(builtin.mode),
+            @tagName(builtin.os.tag),
+            if (builtin.os.tag == .linux) "sched_setaffinity (best-effort)" else "no-op (macOS thread_policy not exposed in std; rely on QoS)",
+        },
+    );
+}
+
 /// Run the full Cartesian sweep, calling `out_callback` for every cell. The
 /// callback is the integration boundary with the CSV writer in the
 /// per-dataset harness — we keep this module IO-free so it's testable.
+///
+/// Backwards-compatible wrapper around `runSweepWithProtocol` that uses the
+/// default protocol (1 warm-up cell, no cooldown). New callers (the
+/// per-dataset bench harnesses) should call `runSweepWithProtocol` directly
+/// and pass an explicit protocol; this overload exists so `tac bench`
+/// (src/main.zig) keeps compiling without a touch from the bench-discipline
+/// lane (cross-lane scope coordination, see audit-fixes-master-plan.md).
 pub fn runSweep(
     index: *const storage.Index,
     pack: QueryPack,
@@ -219,9 +309,40 @@ pub fn runSweep(
     ctx: *anyopaque,
     gpa: Allocator,
 ) !void {
+    return runSweepWithProtocol(index, pack, metric, .{}, out_callback, ctx, gpa);
+}
+
+/// Like `runSweep` but takes an explicit `BenchProtocol`.
+///
+/// Discipline: `protocol.warmup_iters` warm-up cells are run (and discarded)
+/// before the timed sweep; `protocol.cooldown_ns` of `nanosleep` is inserted
+/// between timed cells. Warm-up uses a fixed cell from the middle of the
+/// paper grid so it's representative without being free.
+pub fn runSweepWithProtocol(
+    index: *const storage.Index,
+    pack: QueryPack,
+    metric: MetricKind,
+    protocol: BenchProtocol,
+    out_callback: *const fn (row: SweepRow, ctx: *anyopaque) anyerror!void,
+    ctx: *anyopaque,
+    gpa: Allocator,
+) !void {
+    // Warm-up: representative cell, results discarded. Picked from the
+    // middle of the paper grid so caches/branch predictors see a workload
+    // shape close to what the timed sweep will hit.
+    var w: u32 = 0;
+    while (w < protocol.warmup_iters) : (w += 1) {
+        const warm_row = try runCell(index, pack, 80, 1000, null, metric, gpa);
+        // Sink so the optimizer can't elide the warm-up.
+        std.mem.doNotOptimizeAway(warm_row.avg_total_ms);
+    }
+
+    var first: bool = true;
     for (kappa_c_grid) |kc| {
         for (kappa_d_grid) |kd| {
             for (alpha_grid) |a| {
+                if (!first) sleepNs(protocol.cooldown_ns);
+                first = false;
                 const row = try runCell(index, pack, kc, kd, a, metric, gpa);
                 try out_callback(row, ctx);
             }

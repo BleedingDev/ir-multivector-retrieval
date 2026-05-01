@@ -84,14 +84,18 @@ fn parseArgs(m: std.process.Init.Minimal, gpa: std.mem.Allocator) !runner.RunArg
         .git_sha = git_sha,
         .metric = .mrr_at_10,
         .min_rel = 1,
-        .pin_core = 0,
+        // Apple silicon doesn't expose pin_to_core via std; pinToCore is a
+        // no-op on macOS. Leave null to avoid implying a guarantee we don't
+        // have. On Linux the runner still pins when this is non-null.
+        .pin_core = if (@import("builtin").os.tag == .linux) @as(?u32, 0) else null,
     };
 }
 
 pub fn main(m: std.process.Init.Minimal) !void {
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa_state.deinit();
-    const gpa = gpa_state.allocator();
+    // SmpAllocator: thread-safe, hot-path-friendly. DebugAllocator's
+    // bookkeeping inflates per-query latency variance and is unsafe to
+    // publish as headline numbers — see L10 in audit-fixes-master-plan.md.
+    const gpa = std.heap.smp_allocator;
 
     const args = try parseArgs(m, gpa);
     defer {
@@ -105,5 +109,6 @@ pub fn main(m: std.process.Init.Minimal) !void {
     // Surface that the linker pulls in the public sweep API.
     _ = tac.retrieval.bench.csv_header;
 
-    try runner.runDatasetSweep(args, gpa);
+    const protocol = runner.protocolFromEnv(m.environ);
+    try runner.runDatasetSweep(args, protocol, gpa);
 }
