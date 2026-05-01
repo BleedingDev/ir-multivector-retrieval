@@ -42,6 +42,7 @@ pub const retrieval = struct {
 pub const eval = struct {
     pub const metrics = @import("eval/metrics.zig");
     pub const latency = @import("eval/latency.zig");
+    pub const qrels = @import("eval/qrels.zig");
 };
 
 test {
