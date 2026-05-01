@@ -47,6 +47,12 @@ pub const ClusteringParams = struct {
     /// k-means subproblems are independent, so this is embarrassingly
     /// parallel; only sync is the final WCSS sum (per-token slot summed
     /// after waitAndWork).
+    ///
+    /// Allocator contract: when `n_threads > 1`, `clusterFlat`'s `gpa`
+    /// MUST be thread-safe. Each chunk worker `gpa.alloc`s its own
+    /// `gather` scratch and the per-token kmeans loop allocates
+    /// centroids/assignments. Pass an allocator with internal locking
+    /// (e.g. `std.heap.smp_allocator`).
     n_threads: u32 = 1,
 };
 
@@ -777,6 +783,13 @@ pub fn clusterFlat(
         defer gpa.free(threads);
 
         const chunk = (n_distinct + n_threads - 1) / n_threads;
+        // Spawn-failure cleanup mirrors src/index/hnsw.zig:865 — if
+        // `std.Thread.spawn` fails partway through, already-started
+        // workers still hold pointers into `ctxs[*]` (which the outer
+        // `defer gpa.free(ctxs)` will free) and into `centroids` /
+        // `assignments` / `gather` scratch. Join them before
+        // propagating the error.
+        var spawned: usize = 0;
         for (0..n_threads) |t| {
             const lo = t * chunk;
             const hi = @min((t + 1) * chunk, n_distinct);
@@ -797,9 +810,13 @@ pub fn clusterFlat(
                 .lo = lo,
                 .hi = hi,
             };
-            threads[t] = try std.Thread.spawn(.{}, ChunkRunner.run, .{&ctxs[t]});
+            threads[t] = std.Thread.spawn(.{}, ChunkRunner.run, .{&ctxs[t]}) catch |err| {
+                for (threads[0..spawned]) |th| th.join();
+                return err;
+            };
+            spawned += 1;
         }
-        for (threads) |th| th.join();
+        for (threads[0..spawned]) |th| th.join();
 
         for (ctxs) |c| {
             if (c.err_out) |err| return err;

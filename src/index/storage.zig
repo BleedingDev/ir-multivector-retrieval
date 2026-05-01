@@ -174,6 +174,11 @@ pub const BuildParams = struct {
     theta: u32 = constants.TAC_THETA,
     /// Worker threads for the per-token Lloyd loop (paper §3 parallelism).
     /// `1` is serial; >1 dispatches via std.Thread.spawn with static chunks.
+    /// When `n_threads > 1`, callers MUST pass a thread-safe allocator to
+    /// `build` — `parallelTokenLoop`'s workers concurrently allocate
+    /// per-thread scratch, and the same `gpa` is threaded into
+    /// `tac.clusterFlat` and `pq_mod.train`, both of which share the
+    /// same contract (e.g. `std.heap.smp_allocator`).
     n_threads: u32 = 1,
     /// When true, stage timings are printed to stderr.
     verbose: bool = false,
@@ -220,12 +225,21 @@ fn parallelTokenLoop(
     const threads = try gpa.alloc(std.Thread, T);
     defer gpa.free(threads);
     const chunk = (n_tokens + T - 1) / T;
+    // Spawn-failure cleanup mirrors src/index/hnsw.zig:865 — if
+    // `std.Thread.spawn` fails partway through, already-spawned workers
+    // still reference `ctx` and `errs[*]` (which `defer gpa.free(errs)`
+    // would free). Join them before propagating the error.
+    var spawned: usize = 0;
     for (0..T) |t| {
         const lo: u64 = @as(u64, t) * chunk;
         const hi: u64 = @min(lo + chunk, n_tokens);
-        threads[t] = try std.Thread.spawn(.{}, Run.run, .{ ctx, lo, hi, &errs[t] });
+        threads[t] = std.Thread.spawn(.{}, Run.run, .{ ctx, lo, hi, &errs[t] }) catch |err| {
+            for (threads[0..spawned]) |th| th.join();
+            return err;
+        };
+        spawned += 1;
     }
-    for (threads) |th| th.join();
+    for (threads[0..spawned]) |th| th.join();
     for (errs) |c| if (c.e) |err| return err;
 }
 

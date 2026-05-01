@@ -149,6 +149,12 @@ pub inline fn lookup(table: []const f32, n_q: u32, m: u32, code: u8, i: u32) f32
 /// (paper §4 + §5.3 layout assumes per-subspace independence). Subspace
 /// k-means is the dominant cost on large corpora; this is the
 /// highest-leverage parallelism in the build pipeline.
+///
+/// Allocator contract: when `n_threads > 1`, `gpa` MUST be thread-safe.
+/// Workers concurrently `gpa.alloc`/`gpa.free` per-subspace scratch
+/// (see `WorkerRunner.run`) and indirectly via `kmeans.fit` (which
+/// allocates centroids/assignments per subspace). Pass an allocator
+/// with internal locking (e.g. `std.heap.smp_allocator`).
 pub fn train(
     residuals: []const f32,
     dim: u32,
@@ -247,6 +253,13 @@ pub fn train(
         };
 
         var next_subspace = std.atomic.Value(u32).init(0);
+        // Spawn-failure cleanup mirrors src/index/hnsw.zig:865 — if
+        // `std.Thread.spawn` fails partway through this loop, already-
+        // started workers still reference `ctxs[*]` and `next_subspace`
+        // on the parent's stack. Join them before returning so the
+        // outer `defer gpa.free(ctxs)` / `defer gpa.free(threads)`
+        // don't run while live threads are still touching that memory.
+        var spawned: usize = 0;
         for (0..real_threads) |t| {
             ctxs[t] = .{
                 .residuals = residuals,
@@ -260,9 +273,13 @@ pub fn train(
                 .next_subspace = &next_subspace,
                 .err_out = null,
             };
-            threads[t] = try std.Thread.spawn(.{}, WorkerRunner.run, .{&ctxs[t]});
+            threads[t] = std.Thread.spawn(.{}, WorkerRunner.run, .{&ctxs[t]}) catch |err| {
+                for (threads[0..spawned]) |th| th.join();
+                return err;
+            };
+            spawned += 1;
         }
-        for (threads) |th| th.join();
+        for (threads[0..spawned]) |th| th.join();
         for (ctxs) |c| if (c.err_out) |err| return err;
     }
 
@@ -440,6 +457,35 @@ test "train: deterministic — same seed → byte-equal codebooks" {
     var p2 = try train(buf, dim, 1234, 1, a);
     defer p2.deinit(a);
     try testing.expectEqualSlices(f32, p1.codebooks, p2.codebooks);
+}
+
+test "train: parallel spawn cleanup — high n_threads stays leak-free and byte-equal" {
+    // Stress the parallel spawn loop's cleanup pattern (mirrors
+    // src/index/hnsw.zig:865). Pass `n_threads` larger than PQ_M so
+    // `real_threads = min(n_threads, PQ_M) = PQ_M` takes the
+    // inner-kmeans-parallel branch (kmeans_inner > 1). Each of PQ_M=32
+    // outer workers `gpa.alloc`s its own scratch and invokes a
+    // multi-threaded `kmeans.fit`. std.testing.allocator's leak
+    // detection asserts no thread/scratch is dropped on the success
+    // path (the cleanup path is correctness-by-construction modeled
+    // after the HNSW reference — simulating a real spawn failure
+    // requires invasive stubbing of std.Thread.spawn). Byte-equality
+    // with the serial path proves no worker context is freed-while-used.
+    const a = std.testing.allocator;
+    const dim: u32 = 32;
+    const n: u32 = 256;
+    const buf = try a.alloc(f32, @as(usize, n) * @as(usize, dim));
+    defer a.free(buf);
+    var prng = std.Random.DefaultPrng.init(0xBEEFCAFE);
+    for (buf) |*x| x.* = prng.random().floatNorm(f32);
+    try vec.normalizeRowsInPlace(buf, dim);
+
+    var p_serial = try train(buf, dim, 7777, 1, a);
+    defer p_serial.deinit(a);
+    // n_threads=64 > PQ_M=32 → real_threads=32, kmeans_inner=2.
+    var p_oversub = try train(buf, dim, 7777, 64, a);
+    defer p_oversub.deinit(a);
+    try testing.expectEqualSlices(f32, p_serial.codebooks, p_oversub.codebooks);
 }
 
 test "train: work-stealing dispatch is byte-equal across n_threads" {
