@@ -79,9 +79,29 @@ class EncodedDoc:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Encode docs.jsonl into tokens.bin")
-    p.add_argument("--docs", type=Path, required=True, help="path to docs.jsonl")
-    p.add_argument("--out", type=Path, required=True, help="output tokens.bin path")
+    p = argparse.ArgumentParser(
+        description="Encode docs.jsonl or queries.jsonl into tokens.bin (format v2)"
+    )
+    p.add_argument(
+        "--mode",
+        choices=("docs", "queries"),
+        default="docs",
+        help=(
+            "encoding mode (default: docs). queries mode adds [Q] prefix via "
+            "is_query=True and skips the skiplist drop so all query tokens "
+            "are preserved per paper §5."
+        ),
+    )
+    p.add_argument(
+        "--docs",
+        type=Path,
+        required=True,
+        help=(
+            "path to input JSONL. In docs mode each line needs {doc_id, text}. "
+            "In queries mode each line needs {qid, text}."
+        ),
+    )
+    p.add_argument("--out", type=Path, required=True, help="output bin path")
     p.add_argument(
         "--model",
         type=str,
@@ -120,7 +140,12 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def read_docs_jsonl(path: Path, max_docs: int | None) -> list[dict]:
+def read_docs_jsonl(path: Path, max_docs: int | None, mode: str) -> list[dict]:
+    """Load JSONL records. In `docs` mode each line is `{doc_id, text}`;
+    in `queries` mode each line is `{qid, text}`. The id key is normalised to
+    `doc_id` in the returned dicts so the rest of the pipeline (encode_docs,
+    write_metadata) doesn't need to branch."""
+    id_key = "doc_id" if mode == "docs" else "qid"
     out: list[dict] = []
     with path.open("r", encoding="utf-8") as f:
         for lineno, line in enumerate(f, start=1):
@@ -131,10 +156,14 @@ def read_docs_jsonl(path: Path, max_docs: int | None) -> list[dict]:
                 obj = json.loads(line)
             except json.JSONDecodeError as e:
                 raise SystemExit(f"{path}:{lineno}: malformed JSON: {e}") from e
-            if "doc_id" not in obj or "text" not in obj:
+            if id_key not in obj or "text" not in obj:
                 raise SystemExit(
-                    f"{path}:{lineno}: each line needs 'doc_id' and 'text' fields"
+                    f"{path}:{lineno}: each line needs '{id_key}' and 'text' fields"
                 )
+            # Normalise: downstream uses obj["doc_id"]; in queries mode that
+            # holds the qid value.
+            if mode == "queries":
+                obj = {"doc_id": obj[id_key], "text": obj["text"]}
             out.append(obj)
             if max_docs is not None and len(out) >= max_docs:
                 break
@@ -144,6 +173,7 @@ def read_docs_jsonl(path: Path, max_docs: int | None) -> list[dict]:
 def encode_docs(
     docs: list[dict],
     *,
+    mode: str,
     model_name: str,
     device: str,
     batch_size: int,
@@ -187,12 +217,13 @@ def encode_docs(
     dim: int | None = None
 
     target_device = torch.device(device)
+    is_query = mode == "queries"
 
     for batch_start in range(0, len(docs), batch_size):
         batch = docs[batch_start : batch_start + batch_size]
         texts = [d["text"] for d in batch]
         try:
-            features = model.tokenize(texts, is_query=False)
+            features = model.tokenize(texts, is_query=is_query)
             features = {
                 k: (v.to(target_device) if hasattr(v, "to") else v)
                 for k, v in features.items()
@@ -202,8 +233,17 @@ def encode_docs(
             input_ids = features["input_ids"]  # [B, T]
             tok_emb = out["token_embeddings"]  # [B, T, dim]
             attn = out["attention_mask"].bool()
-            skip = model.skiplist_mask(input_ids=input_ids, skiplist=model.skiplist).bool()
-            keep = skip & attn  # [B, T]
+            if is_query:
+                # paper §5: queries keep all attended tokens (no skiplist drop)
+                # so n_q includes the [Q] prefix and any punctuation. ColBERT/
+                # pylate also pads queries to a fixed max_query_length; the
+                # attention mask handles the padding bits.
+                keep = attn
+            else:
+                skip = model.skiplist_mask(
+                    input_ids=input_ids, skiplist=model.skiplist
+                ).bool()
+                keep = skip & attn
         except Exception as e:  # noqa: BLE001
             for d in batch:
                 dropped.append((str(d["doc_id"]), f"batch encode failed: {e!r}"))
@@ -312,6 +352,7 @@ def write_tokens_bin(out_path: Path, encoded: list[EncodedDoc], dim: int) -> dic
 def write_metadata(
     meta_path: Path,
     *,
+    mode: str,
     model_name: str,
     dim: int,
     n_docs: int,
@@ -320,24 +361,37 @@ def write_metadata(
     dropped: list[tuple[str, str]],
     docs_jsonl: Path,
 ) -> None:
-    meta = {
-        "format_version": TOKEN_DUMP_VERSION,
-        "encoder": model_name,
-        "encoder_dim": dim,
-        "n_docs": n_docs,
-        "n_tokens": n_tokens,
-        "doc_id_map": doc_ids,
-        "dropped": [{"doc_id": d, "reason": r} for d, r in dropped],
-        "built_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-        "tool": "tools/encode.py",
-        "tool_version": "0.2",
-        "source_jsonl": str(docs_jsonl),
-        "notes": [
+    is_query = mode == "queries"
+    id_field = "qid" if is_query else "doc_id"
+    map_field = "qid_map" if is_query else "doc_id_map"
+    if is_query:
+        notes = [
+            "token_ids are real BERT vocabulary IDs from "
+            "tokenizer(text, is_query=True)['input_ids']: the ColBERT [Q] "
+            "prefix is preserved and ALL attended tokens are kept (no "
+            "skiplist drop on the query side, per paper §5). Format v2.",
+        ]
+    else:
+        notes = [
             "token_ids are real BERT vocabulary IDs from "
             "tokenizer(text)['input_ids'] with the ColBERT [D] prefix "
             "preserved and skiplist (punctuation) tokens dropped, exactly "
             "matching pylate.models.ColBERT.encode's keep-mask. Format v2.",
-        ],
+        ]
+    meta = {
+        "format_version": TOKEN_DUMP_VERSION,
+        "mode": mode,
+        "encoder": model_name,
+        "encoder_dim": dim,
+        "n_docs": n_docs,
+        "n_tokens": n_tokens,
+        map_field: doc_ids,
+        "dropped": [{id_field: d, "reason": r} for d, r in dropped],
+        "built_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        "tool": "tools/encode.py",
+        "tool_version": "0.3",
+        "source_jsonl": str(docs_jsonl),
+        "notes": notes,
     }
     meta_path.parent.mkdir(parents=True, exist_ok=True)
     with meta_path.open("w", encoding="utf-8") as f:
@@ -348,20 +402,22 @@ def write_metadata(
 def main() -> None:
     args = parse_args()
 
-    docs = read_docs_jsonl(args.docs, args.max_docs)
+    docs = read_docs_jsonl(args.docs, args.max_docs, args.mode)
     if not docs:
-        raise SystemExit(f"{args.docs}: no docs found")
-    print(f"loaded {len(docs)} docs from {args.docs}", file=sys.stderr)
+        raise SystemExit(f"{args.docs}: no records found")
+    noun = "queries" if args.mode == "queries" else "docs"
+    print(f"loaded {len(docs)} {noun} from {args.docs}", file=sys.stderr)
 
     encoded, dropped, dim = encode_docs(
         docs,
+        mode=args.mode,
         model_name=args.model,
         device=args.device,
         batch_size=args.batch,
         trust_remote_code=args.trust_remote_code,
     )
     print(
-        f"encoded {len(encoded)} docs (dim={dim}, dropped={len(dropped)})",
+        f"encoded {len(encoded)} {noun} (dim={dim}, dropped={len(dropped)})",
         file=sys.stderr,
     )
 
@@ -375,6 +431,7 @@ def main() -> None:
     meta_path = args.meta_out or args.out.with_suffix(args.out.suffix + ".meta.json")
     write_metadata(
         meta_path,
+        mode=args.mode,
         model_name=args.model,
         dim=dim,
         n_docs=stats["n_docs"],
