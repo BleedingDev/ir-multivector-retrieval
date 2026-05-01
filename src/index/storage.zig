@@ -172,7 +172,23 @@ pub const BuildParams = struct {
     tau: u32 = constants.TAC_TAU,
     epsilon: u32 = constants.TAC_EPSILON,
     theta: u32 = constants.TAC_THETA,
+    /// Worker threads for the per-token Lloyd loop (paper §3 parallelism).
+    /// `1` is serial; >1 dispatches via std.Thread.spawn with static chunks.
+    n_threads: u32 = 1,
+    /// When true, stage timings are printed to stderr.
+    verbose: bool = false,
 };
+
+/// Monotonic ns timestamp (Zig 0.16: std.time.Timer is gone behind std.Io).
+fn nowNs() u64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
+fn msSince(start_ns: u64) f64 {
+    return @as(f64, @floatFromInt(nowNs() - start_ns)) / 1e6;
+}
 
 /// In-memory bundle returned by `build`. The caller writes `bytes` to disk
 /// (or hands it to `parse` for a same-process round-trip). All transient
@@ -214,7 +230,10 @@ pub fn build(
     const n_tokens: u64 = td.n_tokens;
     const n_docs: u64 = td.n_docs;
 
+    const verbose = params.verbose;
+
     // ---- 1. TAC clustering (paper §3). ----
+    const t1_0 = nowNs();
     var clu = try tac.clusterFlat(td.token_ids, td.vectors, dim, .{
         .kappa_total = params.kappa_total,
         .mu = params.mu,
@@ -222,12 +241,15 @@ pub fn build(
         .epsilon = params.epsilon,
         .theta = params.theta,
         .seed = params.seed,
+        .n_threads = params.n_threads,
     }, gpa);
     defer clu.deinit(gpa);
+    if (verbose) std.debug.print("    [stage] tac.clusterFlat:  {d:8.1} ms\n", .{msSince(t1_0)});
 
     const kappa: u32 = params.kappa_total;
 
     // ---- 2. Residuals + per-vector norms (paper §4). ----
+    const t2_0 = nowNs();
     const residuals = try gpa.alloc(f32, @intCast(n_tokens * @as(u64, dim)));
     defer gpa.free(residuals);
     const residual_norms = try gpa.alloc(f32, @intCast(n_tokens));
@@ -257,12 +279,16 @@ pub fn build(
             }
         }
     }
+    if (verbose) std.debug.print("    [stage] residuals + norms: {d:8.1} ms\n", .{msSince(t2_0)});
 
     // ---- 3. PQ training (paper §4). ----
-    var pq = try pq_mod.train(residuals, dim, params.seed +% 0xa1b2c3d4, gpa);
+    const t3_0 = nowNs();
+    var pq = try pq_mod.train(residuals, dim, params.seed +% 0xa1b2c3d4, params.n_threads, gpa);
     errdefer pq.deinit(gpa);
+    if (verbose) std.debug.print("    [stage] pq.train:          {d:8.1} ms\n", .{msSince(t3_0)});
 
     // ---- 4. Encode every residual into a flat M·n_tokens code stream. ----
+    const t4_0 = nowNs();
     const total_codes: u64 = n_tokens * @as(u64, constants.PQ_M);
     const pq_codes = try gpa.alloc(u8, @intCast(total_codes));
     errdefer gpa.free(pq_codes);
@@ -274,11 +300,13 @@ pub fn build(
             try pq.encode(r, slot);
         }
     }
+    if (verbose) std.debug.print("    [stage] pq.encode:         {d:8.1} ms\n", .{msSince(t4_0)});
 
     // ---- 5. HNSW over (re-normalised) centroids (paper §4 + §11). ----
     // paper-gap §3: TAC outputs raw means. We need unit-norm for HNSW dot ≡
     // cosine. Make a working copy so we don't disturb `clu.centroids` for
     // any downstream caller.
+    const t5_0 = nowNs();
     const centroids_norm = try gpa.alloc(f32, kappa * dim);
     errdefer gpa.free(centroids_norm);
     @memcpy(centroids_norm, clu.centroids);
@@ -292,12 +320,16 @@ pub fn build(
         gpa,
     );
     errdefer hnsw_g.deinit(gpa);
+    if (verbose) std.debug.print("    [stage] hnsw.build:        {d:8.1} ms\n", .{msSince(t5_0)});
 
     // ---- 6. Inverted lists (paper §4, doc-level grain). ----
+    const t6_0 = nowNs();
     var ilists = try inverted_list.build(clu.assignments, td.doc_offsets, kappa, gpa);
     errdefer ilists.deinit(gpa);
+    if (verbose) std.debug.print("    [stage] inverted_list:     {d:8.1} ms\n", .{msSince(t6_0)});
 
     // ---- 7. Serialise. ----
+    const t7_0 = nowNs();
     const out = BuildOutput{
         .dim = dim,
         .kappa = kappa,
@@ -319,6 +351,7 @@ pub fn build(
     errdefer gpa.free(buf);
 
     _ = try serialise(out, buf);
+    if (verbose) std.debug.print("    [stage] serialise:         {d:8.1} ms\n", .{msSince(t7_0)});
 
     // Drop transient build state — image is self-contained.
     ilists.deinit(gpa);
@@ -907,7 +940,7 @@ const Fixture = struct {
         while (t < n_tokens) : (t += 1) {
             try vec.normalizeInPlace(residuals[t * dim ..][0..dim]);
         }
-        var pq = try pq_mod.train(residuals, dim, 7, gpa);
+        var pq = try pq_mod.train(residuals, dim, 7, 1, gpa);
         errdefer pq.deinit(gpa);
 
         // ---- Encode each token to PQ codes. ----

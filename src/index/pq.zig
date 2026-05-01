@@ -35,7 +35,7 @@ pub const PqError = error{
     EmptyCorpus,
     OutBufferWrongSize,
     NQMismatch,
-} || Allocator.Error || vec.VecError || kmeans.KMeansError;
+} || Allocator.Error || vec.VecError || kmeans.KMeansError || std.Thread.SpawnError;
 
 /// Trained PQ codebooks. Owner of `codebooks`; call `deinit`.
 pub const PQ = struct {
@@ -144,10 +144,16 @@ pub inline fn lookup(table: []const f32, n_q: u32, m: u32, code: u8, i: u32) f32
 /// `residuals` slice the caller passes — the storage builder is responsible
 /// for sampling if the corpus is too large. Documented at the call site in
 /// `storage.zig`'s build pipeline.
+/// Train PQ codebooks with M=32 independent subspace k-means. Setting
+/// `n_threads > 1` parallelises the M subspaces across worker threads
+/// (paper §4 + §5.3 layout assumes per-subspace independence). Subspace
+/// k-means is the dominant cost on large corpora; this is the
+/// highest-leverage parallelism in the build pipeline.
 pub fn train(
     residuals: []const f32,
     dim: u32,
     seed: u64,
+    n_threads: u32,
     gpa: Allocator,
 ) PqError!PQ {
     if (dim == 0) return error.DimMismatch;
@@ -165,41 +171,72 @@ pub fn train(
     const codebooks = try gpa.alloc(f32, total_codebook_floats);
     errdefer gpa.free(codebooks);
 
-    // Reusable scratch — one subspace's slice across all residuals.
-    const sub_buf = try gpa.alloc(f32, n_residuals * @as(usize, sub_dim));
-    defer gpa.free(sub_buf);
+    if (n_threads <= 1) {
+        // ---- Serial. ----
+        const sub_buf = try gpa.alloc(f32, n_residuals * @as(usize, sub_dim));
+        defer gpa.free(sub_buf);
 
-    var m: u32 = 0;
-    while (m < constants.PQ_M) : (m += 1) {
-        // Slice subspace m out of every residual into a contiguous buffer.
-        var i: usize = 0;
-        while (i < n_residuals) : (i += 1) {
-            const src = residuals[i * @as(usize, dim) + m * sub_dim ..][0..sub_dim];
-            const dst = sub_buf[i * @as(usize, sub_dim) ..][0..sub_dim];
-            @memcpy(dst, src);
+        var m: u32 = 0;
+        while (m < constants.PQ_M) : (m += 1) {
+            try trainOneSubspace(residuals, dim, sub_dim, n_residuals, m, seed, sub_buf, codebooks, gpa);
         }
+    } else {
+        // ---- Parallel: chunk M=32 across workers. ----
+        const ChunkCtx = struct {
+            residuals: []const f32,
+            dim: u32,
+            sub_dim: u32,
+            n_residuals: usize,
+            seed: u64,
+            codebooks: []f32,
+            gpa: Allocator,
+            err_out: ?PqError,
+            lo: u32,
+            hi: u32,
+        };
+        const ChunkRunner = struct {
+            fn run(ctx: *ChunkCtx) void {
+                const sub_buf = ctx.gpa.alloc(f32, ctx.n_residuals * @as(usize, ctx.sub_dim)) catch |err| {
+                    ctx.err_out = err;
+                    return;
+                };
+                defer ctx.gpa.free(sub_buf);
+                var m = ctx.lo;
+                while (m < ctx.hi) : (m += 1) {
+                    trainOneSubspace(ctx.residuals, ctx.dim, ctx.sub_dim, ctx.n_residuals, m, ctx.seed, sub_buf, ctx.codebooks, ctx.gpa) catch |err| {
+                        ctx.err_out = err;
+                        return;
+                    };
+                }
+            }
+        };
 
-        // Per-subspace k-means with 256 codewords. If a subspace has fewer
-        // than 256 distinct training points the kmeans `k>=n` branch handles
-        // it deterministically (degenerate centroids are written; we accept
-        // them since they will never be the closest centroid for a real
-        // residual).
-        var res = try kmeans.fit(sub_buf, sub_dim, .{
-            .k = constants.PQ_CENTROIDS,
-            .max_iters = 25,
-            .tol = 1e-4,
-            .seed = seed +% @as(u64, m),
-        }, gpa);
-        defer res.deinit(gpa);
+        const real_threads = @min(n_threads, constants.PQ_M);
+        const ctxs = try gpa.alloc(ChunkCtx, real_threads);
+        defer gpa.free(ctxs);
+        const threads = try gpa.alloc(std.Thread, real_threads);
+        defer gpa.free(threads);
 
-        const codebook_base: usize =
-            @as(usize, m) *
-            @as(usize, constants.PQ_CENTROIDS) *
-            @as(usize, sub_dim);
-        @memcpy(
-            codebooks[codebook_base .. codebook_base + res.centroids.len],
-            res.centroids,
-        );
+        const chunk = (constants.PQ_M + real_threads - 1) / real_threads;
+        for (0..real_threads) |t| {
+            const lo: u32 = @intCast(t * chunk);
+            const hi: u32 = @min(@as(u32, @intCast((t + 1) * chunk)), constants.PQ_M);
+            ctxs[t] = .{
+                .residuals = residuals,
+                .dim = dim,
+                .sub_dim = sub_dim,
+                .n_residuals = n_residuals,
+                .seed = seed,
+                .codebooks = codebooks,
+                .gpa = gpa,
+                .err_out = null,
+                .lo = lo,
+                .hi = hi,
+            };
+            threads[t] = try std.Thread.spawn(.{}, ChunkRunner.run, .{&ctxs[t]});
+        }
+        for (threads) |th| th.join();
+        for (ctxs) |c| if (c.err_out) |err| return err;
     }
 
     return .{
@@ -207,6 +244,44 @@ pub fn train(
         .sub_dim = sub_dim,
         .codebooks = codebooks,
     };
+}
+
+/// Train one PQ subspace's codebook. Materialises the m-th sub_dim columns
+/// of every residual into `sub_buf`, runs k=256 k-means, copies centroids
+/// into `codebooks[m*256*sub_dim..]`. Pure for distinct `m`.
+fn trainOneSubspace(
+    residuals: []const f32,
+    dim: u32,
+    sub_dim: u32,
+    n_residuals: usize,
+    m: u32,
+    seed: u64,
+    sub_buf: []f32,
+    codebooks: []f32,
+    gpa: Allocator,
+) PqError!void {
+    var i: usize = 0;
+    while (i < n_residuals) : (i += 1) {
+        const src = residuals[i * @as(usize, dim) + m * sub_dim ..][0..sub_dim];
+        const dst = sub_buf[i * @as(usize, sub_dim) ..][0..sub_dim];
+        @memcpy(dst, src);
+    }
+    var res = try kmeans.fit(sub_buf, sub_dim, .{
+        .k = constants.PQ_CENTROIDS,
+        .max_iters = 25,
+        .tol = 1e-4,
+        .seed = seed +% @as(u64, m),
+    }, gpa);
+    defer res.deinit(gpa);
+
+    const codebook_base: usize =
+        @as(usize, m) *
+        @as(usize, constants.PQ_CENTROIDS) *
+        @as(usize, sub_dim);
+    @memcpy(
+        codebooks[codebook_base .. codebook_base + res.centroids.len],
+        res.centroids,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -232,14 +307,14 @@ test "train: dim must be divisible by PQ_M" {
     const a = std.testing.allocator;
     // dim=33 is not divisible by 32 → error.
     const v = [_]f32{0.0} ** 33;
-    const r = train(&v, 33, 1, a);
+    const r = train(&v, 33, 1, 1, a);
     try testing.expectError(error.DimNotDivisibleByM, r);
 }
 
 test "train: empty corpus returns error" {
     const a = std.testing.allocator;
     const v = [_]f32{};
-    const r = train(&v, 32, 1, a);
+    const r = train(&v, 32, 1, 1, a);
     try testing.expectError(error.EmptyCorpus, r);
 }
 
@@ -257,7 +332,7 @@ test "train + decode + encode round-trip on synthetic blobs" {
     // Normalise to mimic post-residual unit-norm vectors.
     try vec.normalizeRowsInPlace(buf, dim);
 
-    var pq = try train(buf, dim, 17, a);
+    var pq = try train(buf, dim, 17, 1, a);
     defer pq.deinit(a);
 
     try testing.expectEqual(@as(u32, 32), pq.dim);
@@ -295,7 +370,7 @@ test "train: reconstruction MSE bounded on synthetic Gaussians" {
     var prng = std.Random.DefaultPrng.init(0xC0DE);
     for (buf) |*x| x.* = prng.random().floatNorm(f32) * 0.1;
 
-    var pq = try train(buf, dim, 7, a);
+    var pq = try train(buf, dim, 7, 1, a);
     defer pq.deinit(a);
 
     var codes: [constants.PQ_M]u8 = undefined;
@@ -326,9 +401,9 @@ test "train: deterministic — same seed → byte-equal codebooks" {
     var prng = std.Random.DefaultPrng.init(99);
     for (buf) |*x| x.* = prng.random().floatNorm(f32);
 
-    var p1 = try train(buf, dim, 1234, a);
+    var p1 = try train(buf, dim, 1234, 1, a);
     defer p1.deinit(a);
-    var p2 = try train(buf, dim, 1234, a);
+    var p2 = try train(buf, dim, 1234, 1, a);
     defer p2.deinit(a);
     try testing.expectEqualSlices(f32, p1.codebooks, p2.codebooks);
 }
@@ -345,7 +420,7 @@ test "buildDistanceTable: matches direct dot product" {
     for (buf) |*x| x.* = prng.random().floatNorm(f32);
     try vec.normalizeRowsInPlace(buf, dim);
 
-    var pq = try train(buf, dim, 1, a);
+    var pq = try train(buf, dim, 1, 1, a);
     defer pq.deinit(a);
 
     const queries = try a.alloc(f32, @as(usize, n_q) * @as(usize, dim));
@@ -389,7 +464,7 @@ test "buildDistanceTable: bad output length is an error" {
     const buf = try a.alloc(f32, 200 * @as(usize, dim));
     defer a.free(buf);
     for (buf, 0..) |*x, idx| x.* = @as(f32, @floatFromInt(idx)) * 0.001;
-    var pq = try train(buf, dim, 0, a);
+    var pq = try train(buf, dim, 0, 1, a);
     defer pq.deinit(a);
     const n_q: u32 = 2;
     const queries = try a.alloc(f32, @as(usize, n_q) * @as(usize, dim));

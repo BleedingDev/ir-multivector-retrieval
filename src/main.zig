@@ -57,6 +57,7 @@ fn cmdIndex(iter: *std.process.Args.Iterator, gpa: Allocator, io: std.Io, cwd: s
     var tau: u32 = tac.constants.TAC_TAU;
     var epsilon: u32 = tac.constants.TAC_EPSILON;
     var theta: u32 = tac.constants.TAC_THETA;
+    var n_threads: u32 = 1;
     var positional: u32 = 0;
 
     while (iter.next()) |arg| {
@@ -64,6 +65,8 @@ fn cmdIndex(iter: *std.process.Args.Iterator, gpa: Allocator, io: std.Io, cwd: s
             kappa = try std.fmt.parseInt(u32, iter.next() orelse return error.MissingArg, 10);
         } else if (std.mem.eql(u8, arg, "--seed")) {
             seed = try std.fmt.parseInt(u64, iter.next() orelse return error.MissingArg, 10);
+        } else if (std.mem.eql(u8, arg, "--threads")) {
+            n_threads = try std.fmt.parseInt(u32, iter.next() orelse return error.MissingArg, 10);
         } else if (std.mem.eql(u8, arg, "--mu")) {
             mu = try std.fmt.parseInt(u32, iter.next() orelse return error.MissingArg, 10);
         } else if (std.mem.eql(u8, arg, "--tau")) {
@@ -109,6 +112,10 @@ fn cmdIndex(iter: *std.process.Args.Iterator, gpa: Allocator, io: std.Io, cwd: s
         );
     }
 
+    if (n_threads > 1) {
+        std.debug.print("  parallel build: {d} threads\n", .{n_threads});
+    }
+
     const t_build_0 = nowNs();
     var image = try tac.index.storage.build(&td, .{
         .kappa_total = kappa,
@@ -117,6 +124,8 @@ fn cmdIndex(iter: *std.process.Args.Iterator, gpa: Allocator, io: std.Io, cwd: s
         .tau = tau,
         .epsilon = epsilon,
         .theta = theta,
+        .n_threads = n_threads,
+        .verbose = true,
     }, gpa);
     defer image.deinit(gpa);
     const t_build_1 = nowNs();

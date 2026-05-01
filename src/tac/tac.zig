@@ -41,6 +41,13 @@ pub const ClusteringParams = struct {
     max_iters: u32 = 25,
     tol: f32 = 1e-4,
     seed: u64,
+    /// Worker threads for the per-token Lloyd loop. `1` is serial
+    /// (preserves all existing test invariants and determinism). >1
+    /// dispatches via std.Thread.Pool — paper §3 says per-token
+    /// k-means subproblems are independent, so this is embarrassingly
+    /// parallel; only sync is the final WCSS sum (per-token slot summed
+    /// after waitAndWork).
+    n_threads: u32 = 1,
 };
 
 pub const ClusteringError = error{
@@ -48,7 +55,7 @@ pub const ClusteringError = error{
     BudgetTooLarge,
     InvalidThresholds,
     EmptyTokenDump,
-} || Allocator.Error || kmeans.KMeansError;
+} || Allocator.Error || kmeans.KMeansError || std.Thread.SpawnError;
 
 /// Token classification per paper §3.3 Phase 1.
 pub const TokenTier = enum(u8) {
@@ -438,6 +445,115 @@ pub fn cluster(
 ///
 /// paper §3.3 phase order: Phase 1+2+3+4 produce κ_j, then per-token Lloyd
 /// produces centroids. Per-token determinism: seed = p.seed XOR token_id.
+
+/// Run k-means for one token's vectors. Materialises rows into the
+/// caller-provided `gather`, fits, copies centroids+assignments into the
+/// global slabs at disjoint indices. Pure from caller's perspective.
+fn runOneTokenKmeans(
+    j: usize,
+    k_j: u32,
+    n_j: u32,
+    group_offsets: []const u32,
+    group_indices: []const u32,
+    vectors: []const f32,
+    dim: u32,
+    p: ClusteringParams,
+    global_off: u32,
+    centroids: []f32,
+    assignments: []u32,
+    gather: []f32,
+    gpa: Allocator,
+) !f32 {
+    const start = group_offsets[j];
+    const end = group_offsets[j + 1];
+
+    var w: usize = 0;
+    var idx_i: u32 = start;
+    while (idx_i < end) : (idx_i += 1) {
+        const src_idx: usize = group_indices[idx_i];
+        @memcpy(
+            gather[w * @as(usize, dim) ..][0..dim],
+            vectors[src_idx * @as(usize, dim) ..][0..dim],
+        );
+        w += 1;
+    }
+
+    var res = try kmeans.fit(
+        gather[0 .. @as(usize, n_j) * dim],
+        dim,
+        .{
+            .k = k_j,
+            .max_iters = p.max_iters,
+            .tol = p.tol,
+            .seed = p.seed ^ @as(u64, j),
+        },
+        gpa,
+    );
+    defer res.deinit(gpa);
+
+    @memcpy(
+        centroids[@as(usize, global_off) * dim ..][0 .. @as(usize, k_j) * dim],
+        res.centroids[0 .. @as(usize, k_j) * dim],
+    );
+
+    w = 0;
+    idx_i = start;
+    while (idx_i < end) : (idx_i += 1) {
+        const src_idx: usize = group_indices[idx_i];
+        assignments[src_idx] = global_off + res.assignments[w];
+        w += 1;
+    }
+
+    return res.wcss;
+}
+
+/// Worker wrapper for std.Thread.Pool. Allocates its own `gather` slab
+/// (size n_j*dim) and writes results to caller-owned slots; errors are
+/// captured rather than thrown because Pool.spawnWg expects a
+/// void-returning function.
+fn runOneTokenWorker(
+    j: usize,
+    k_j: u32,
+    n_j: u32,
+    group_offsets: []const u32,
+    group_indices: []const u32,
+    vectors: []const f32,
+    dim: u32,
+    p: ClusteringParams,
+    global_off: u32,
+    centroids: []f32,
+    assignments: []u32,
+    wcss_out: *f32,
+    err_out: *?ClusteringError,
+    gpa: Allocator,
+) void {
+    const gather = gpa.alloc(f32, @as(usize, n_j) * dim) catch |err| {
+        err_out.* = err;
+        return;
+    };
+    defer gpa.free(gather);
+
+    const wcss = runOneTokenKmeans(
+        j,
+        k_j,
+        n_j,
+        group_offsets,
+        group_indices,
+        vectors,
+        dim,
+        p,
+        global_off,
+        centroids,
+        assignments,
+        gather,
+        gpa,
+    ) catch |err| {
+        err_out.* = err;
+        return;
+    };
+    wcss_out.* = wcss;
+}
+
 pub fn clusterFlat(
     token_ids: []const u32,
     vectors: []const f32,
@@ -557,59 +673,138 @@ pub fn clusterFlat(
     for (freqs) |n_j| {
         if (n_j > max_n_j) max_n_j = n_j;
     }
-    const gather = try gpa.alloc(f32, @as(usize, max_n_j) * dim);
-    defer gpa.free(gather);
 
     var wcss_total: f32 = 0.0;
 
-    for (0..n_distinct) |j| {
-        const k_j = kappa_per_token[j];
-        if (k_j == 0) continue;
-        const start = group_offsets[j];
-        const end = group_offsets[j + 1];
-        const n_j = end - start;
-        if (n_j == 0) continue;
+    if (p.n_threads <= 1) {
+        // ---- Serial path (original; preserves test determinism). ----
+        const gather = try gpa.alloc(f32, @as(usize, max_n_j) * dim);
+        defer gpa.free(gather);
 
-        // Materialise this token's vectors contiguously.
-        var w: usize = 0;
-        var idx_i: u32 = start;
-        while (idx_i < end) : (idx_i += 1) {
-            const src_idx: usize = group_indices[idx_i];
-            @memcpy(
-                gather[w * @as(usize, dim) ..][0..dim],
-                vectors[src_idx * @as(usize, dim) ..][0..dim],
+        for (0..n_distinct) |j| {
+            const k_j = kappa_per_token[j];
+            if (k_j == 0) continue;
+            const n_j = group_offsets[j + 1] - group_offsets[j];
+            if (n_j == 0) continue;
+
+            wcss_total += try runOneTokenKmeans(
+                j,
+                k_j,
+                n_j,
+                group_offsets,
+                group_indices,
+                vectors,
+                dim,
+                p,
+                global_offsets[j],
+                centroids,
+                assignments,
+                gather,
+                gpa,
             );
-            w += 1;
         }
+    } else {
+        // ---- Parallel path (paper §3 "independent κ_j-means per token"). ----
+        // Static chunk distribution: each of n_threads threads owns a
+        // contiguous slice of token IDs [lo, hi) and processes them
+        // sequentially with one persistent gather buffer per thread. This
+        // avoids std.Thread.Pool (gone in Zig 0.16; std.Io.Group replaces it
+        // but threading an Io through TAC is invasive). Load balance is
+        // good for 8K+ tokens × 10 threads since per-token work varies but
+        // averages by law of large numbers; if we ever profile and find
+        // tail tokens dominating, switch to a work-stealing queue.
+        const n_threads = p.n_threads;
+        const ChunkCtx = struct {
+            kappa_per_token: []const u32,
+            group_offsets: []const u32,
+            group_indices: []const u32,
+            global_offsets: []const u32,
+            vectors: []const f32,
+            dim: u32,
+            params: ClusteringParams,
+            max_n_j: u32,
+            centroids: []f32,
+            assignments: []u32,
+            gpa: Allocator,
+            wcss_out: f32,
+            err_out: ?ClusteringError,
+            lo: usize,
+            hi: usize,
+        };
 
-        var res = try kmeans.fit(
-            gather[0 .. @as(usize, n_j) * dim],
-            dim,
-            .{
-                .k = k_j,
-                .max_iters = p.max_iters,
-                .tol = p.tol,
-                .seed = p.seed ^ @as(u64, j),
-            },
-            gpa,
-        );
-        defer res.deinit(gpa);
+        const ChunkRunner = struct {
+            fn run(ctx: *ChunkCtx) void {
+                const gather = ctx.gpa.alloc(f32, @as(usize, ctx.max_n_j) * ctx.dim) catch |err| {
+                    ctx.err_out = err;
+                    return;
+                };
+                defer ctx.gpa.free(gather);
 
-        const global_off = global_offsets[j];
-        @memcpy(
-            centroids[@as(usize, global_off) * dim ..][0 .. @as(usize, k_j) * dim],
-            res.centroids[0 .. @as(usize, k_j) * dim],
-        );
+                var wcss: f32 = 0.0;
+                var j = ctx.lo;
+                while (j < ctx.hi) : (j += 1) {
+                    const k_j = ctx.kappa_per_token[j];
+                    if (k_j == 0) continue;
+                    const n_j = ctx.group_offsets[j + 1] - ctx.group_offsets[j];
+                    if (n_j == 0) continue;
+                    const w = runOneTokenKmeans(
+                        j,
+                        k_j,
+                        n_j,
+                        ctx.group_offsets,
+                        ctx.group_indices,
+                        ctx.vectors,
+                        ctx.dim,
+                        ctx.params,
+                        ctx.global_offsets[j],
+                        ctx.centroids,
+                        ctx.assignments,
+                        gather,
+                        ctx.gpa,
+                    ) catch |err| {
+                        ctx.err_out = err;
+                        return;
+                    };
+                    wcss += w;
+                }
+                ctx.wcss_out = wcss;
+            }
+        };
 
-        w = 0;
-        idx_i = start;
-        while (idx_i < end) : (idx_i += 1) {
-            const src_idx: usize = group_indices[idx_i];
-            assignments[src_idx] = global_off + res.assignments[w];
-            w += 1;
+        const ctxs = try gpa.alloc(ChunkCtx, n_threads);
+        defer gpa.free(ctxs);
+        const threads = try gpa.alloc(std.Thread, n_threads);
+        defer gpa.free(threads);
+
+        const chunk = (n_distinct + n_threads - 1) / n_threads;
+        for (0..n_threads) |t| {
+            const lo = t * chunk;
+            const hi = @min((t + 1) * chunk, n_distinct);
+            ctxs[t] = .{
+                .kappa_per_token = kappa_per_token,
+                .group_offsets = group_offsets,
+                .group_indices = group_indices,
+                .global_offsets = global_offsets,
+                .vectors = vectors,
+                .dim = dim,
+                .params = p,
+                .max_n_j = max_n_j,
+                .centroids = centroids,
+                .assignments = assignments,
+                .gpa = gpa,
+                .wcss_out = 0.0,
+                .err_out = null,
+                .lo = lo,
+                .hi = hi,
+            };
+            threads[t] = try std.Thread.spawn(.{}, ChunkRunner.run, .{&ctxs[t]});
         }
+        for (threads) |th| th.join();
 
-        wcss_total += res.wcss;
+        for (ctxs) |c| {
+            if (c.err_out) |err| return err;
+            wcss_total += c.wcss_out;
+        }
     }
 
     // Final invariant: every assignment is a valid centroid id.
