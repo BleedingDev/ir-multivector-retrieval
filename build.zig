@@ -43,6 +43,24 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
+    // Integration tests under tests/integration/ — Python-free, always wired
+    // into `zig build test`. Each file imports the public `tac` module the
+    // same way in-tree unit tests do.
+    // L8 zig-determinism-doc: full-build n_threads byte-equality contract.
+    inline for (.{
+        "tests/integration/build_determinism_test.zig",
+    }) |integration_src| {
+        const integration_mod = b.createModule(.{
+            .root_source_file = b.path(integration_src),
+            .target = target,
+            .optimize = optimize,
+        });
+        integration_mod.addImport("tac", lib_mod);
+        const integration_tests = b.addTest(.{ .root_module = integration_mod });
+        const run_integration_tests = b.addRunArtifact(integration_tests);
+        test_step.dependOn(&run_integration_tests.step);
+    }
+
     // Live tests gate Python/torch/pylate-dependent harnesses behind a build
     // option so the default `zig build test` stays Python-free for any
     // contributor who hasn't provisioned tools/.venv. Enable explicitly:
