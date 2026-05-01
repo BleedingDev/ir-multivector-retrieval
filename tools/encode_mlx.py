@@ -66,7 +66,37 @@ def parse_args() -> argparse.Namespace:
         help="MLX compute dtype. fp16 default to mirror encode.py's MPS default.",
     )
     p.add_argument(
-        "--batch", type=int, default=32, help="docs per forward pass batch"
+        "--batch",
+        type=int,
+        default=None,
+        help=(
+            "docs per forward pass batch (legacy flag kept for the parity "
+            "harness). Prefer --encoder-batch-size; when both are set "
+            "--encoder-batch-size wins. When neither is set, the default "
+            "is 128 on fp16 and 64 on fp32."
+        ),
+    )
+    p.add_argument(
+        "--encoder-batch-size",
+        type=int,
+        default=None,
+        help=(
+            "encoder forward batch (overrides --batch when set). Default "
+            "when unset: 128 on fp16, 64 on fp32. Larger batches amortize "
+            "fixed kernel/dispatch cost on Apple Silicon and matter most "
+            "with --sort-by-length where padding waste shrinks per batch."
+        ),
+    )
+    p.add_argument(
+        "--sort-by-length",
+        action="store_true",
+        help=(
+            "tokenize the full corpus once to learn per-doc token lengths, "
+            "sort docs by length ascending (stable) before batching, and "
+            "restore input order at write time. Reduces padding waste on "
+            "heterogeneous corpora; at the price of one extra full-corpus "
+            "tokenize pass."
+        ),
     )
     p.add_argument(
         "--max-docs", type=int, default=None, help="optional cap (smoke testing)"
@@ -323,16 +353,22 @@ def encode_docs_mlx(
     dtype: str,
     batch_size: int,
     trust_remote_code: bool,
+    sort_by_length: bool = False,
 ) -> tuple[list[EncodedDoc], list[tuple[str, str]], int]:
     """Encode docs through MLX. Returns (encoded, dropped, dim).
 
     Tokenizer + skiplist come from pylate (CPU, deterministic, fast).
     Forward pass + L2-norm run in MLX. Output rows match the keep-mask
     (skiplist & attention_mask), exactly as encode.py does.
+
+    When sort_by_length=True, docs are reordered by tokenized length before
+    batching so each padded batch's max-T shrinks. Output order is restored
+    to input order before return so doc_id_map / qid_map remain unchanged.
     """
     # Tokenizer comes from pylate. We don't run model.forward through pylate
     # — only model.tokenize and model.skiplist_mask.
     from pylate import models  # type: ignore
+    import numpy as np
 
     pl = models.ColBERT(
         model_name_or_path=model_name,
@@ -375,12 +411,30 @@ def encode_docs_mlx(
 
     skip_set = set(int(s) for s in skiplist)
 
-    encoded: list[EncodedDoc] = []
-    dropped: list[tuple[str, str]] = []
     dim = cfg["projection_out"]
 
-    for batch_start in range(0, len(docs), batch_size):
-        batch = docs[batch_start : batch_start + batch_size]
+    # Build the iteration order. Default: input order (range). When
+    # sort_by_length is on, tokenize the full corpus once to learn per-doc
+    # lengths, then sort indices ascending by length (np.argsort is stable
+    # via kind='stable'). Output order is restored at the end via slot fill.
+    n = len(docs)
+    if sort_by_length and n > 1:
+        all_features = pl.tokenize([d["text"] for d in docs], is_query=False)
+        # attention_mask sum per row gives unpadded token count.
+        lengths = all_features["attention_mask"].sum(dim=1).cpu().numpy()
+        order = np.argsort(lengths, kind="stable").tolist()
+    else:
+        order = list(range(n))
+
+    # Slot-keyed output so we can restore input order regardless of the
+    # iteration order. None = not yet encoded; later replaced with EncodedDoc
+    # or the doc was dropped (recorded separately, position left None).
+    slots: list[EncodedDoc | None] = [None] * n
+    dropped: list[tuple[str, str]] = []
+
+    for batch_start in range(0, n, batch_size):
+        batch_indices = order[batch_start : batch_start + batch_size]
+        batch = [docs[i] for i in batch_indices]
         texts = [d["text"] for d in batch]
         try:
             features = pl.tokenize(texts, is_query=False)
@@ -409,21 +463,10 @@ def encode_docs_mlx(
         ids_np = input_ids_pt.cpu().numpy()
         attn_np = attn_pt.cpu().numpy()
         emb_np = tok_emb.astype(mx.float32)
-        # mlx.array → host: prefer mx.eval + .tolist or numpy() if available
-        if hasattr(emb_np, "__array__"):
-            import numpy as np  # noqa: F401
+        # mlx.array → host: numpy view (zero-copy when supported by MLX).
+        emb_arr = np.array(emb_np, copy=False)
 
-            emb_arr = mx.eval(emb_np)
-            # mlx.core arrays support np.array(arr) conversion
-            import numpy as np
-
-            emb_arr = np.array(emb_np, copy=False)
-        else:
-            import numpy as np
-
-            emb_arr = np.array(emb_np.tolist(), dtype=np.float32)
-
-        for b, d in enumerate(batch):
+        for b, (orig_i, d) in enumerate(zip(batch_indices, batch)):
             try:
                 row_ids = ids_np[b]
                 row_attn = attn_np[b]
@@ -439,16 +482,15 @@ def encode_docs_mlx(
                 kept_emb = emb_arr[b, kept_idx, :]
                 # Cast to float32 list-of-list for the shared writer.
                 vectors = kept_emb.astype("float32").tolist()
-                encoded.append(
-                    EncodedDoc(
-                        doc_id=str(d["doc_id"]),
-                        token_ids=kept_ids,
-                        vectors=vectors,
-                    )
+                slots[orig_i] = EncodedDoc(
+                    doc_id=str(d["doc_id"]),
+                    token_ids=kept_ids,
+                    vectors=vectors,
                 )
             except Exception as e:  # noqa: BLE001
                 dropped.append((str(d["doc_id"]), f"post-process failed: {e!r}"))
 
+    encoded = [s for s in slots if s is not None]
     if not encoded:
         raise SystemExit("no docs encoded successfully — aborting before writing")
     return encoded, dropped, dim
@@ -469,13 +511,23 @@ def main() -> None:
         raise SystemExit(f"{args.docs}: no records found")
     print(f"loaded {len(docs)} docs from {args.docs}", file=sys.stderr)
 
+    if args.encoder_batch_size is not None:
+        batch_size = args.encoder_batch_size
+    elif args.batch is not None:
+        batch_size = args.batch
+    else:
+        # Defaults from plan-13 rec-04: 128 fp16, 64 fp32. Larger batches
+        # amortize fixed kernel/dispatch cost on Apple Silicon.
+        batch_size = 128 if args.dtype == "fp16" else 64
+
     encoded, dropped, dim = encode_docs_mlx(
         docs,
         model_name=args.model,
         weights_path=args.weights,
         dtype=args.dtype,
-        batch_size=args.batch,
+        batch_size=batch_size,
         trust_remote_code=args.trust_remote_code,
+        sort_by_length=args.sort_by_length,
     )
     print(
         f"encoded {len(encoded)} docs (dim={dim}, dropped={len(dropped)})",
