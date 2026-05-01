@@ -1289,3 +1289,109 @@ test "quality regression: TAC matches or beats vanilla k-means at fixed κ" {
     // exact ties unrealistic and we don't tune κ_c/κ_d here.
     try testing.expect(tac_wcss <= vanilla_wcss * 1.25);
 }
+
+test "quality regression: bimodal spread — TAC allocation tracks per-token variance" {
+    // The default synthetic_fixture has near-uniform per-token spread, which
+    // doesn't exercise TAC's allocation strength. paper §3.4 emphasises
+    // TAC's win comes from directing centroids to high-spread tokens.
+    //
+    // This test builds a corpus driven by isotropic Gaussian noise of
+    // meaningfully different widths:
+    //   - "tight" tokens: theme + N(0, σ=0.04²·I) — low s_j
+    //   - "wide"  tokens: theme + N(0, σ=0.40²·I) — ~100× more variance
+    // Both populations are continuous Gaussians (no hidden sub-themes), so
+    // vanilla k-means can't exploit discrete structure to win cheaply.
+    // All tokens share n_j so √n damping is constant; w_j scales with s_j
+    // alone, making TAC's allocation a direct function of per-token spread.
+    //
+    // What we assert (paper-honest):
+    //   1. TAC's wide-token κ-sum strictly > tight-token κ-sum.
+    //   2. TAC WCSS ≤ Vanilla WCSS * 1.25 (matches-or-beats with k-means
+    //      seeding slack). On this corpus a strict win depends on the
+    //      κ_total/ground-truth ratio; "≤" is the honest paper claim.
+    const allocator = testing.allocator;
+
+    const dim: u32 = 8;
+    const n_classes: u32 = 16; // 8 tight + 8 wide
+    const samples_per_token: u32 = 64;
+    const total_vectors: usize = @as(usize, n_classes) * samples_per_token;
+
+    const token_ids = try allocator.alloc(u32, total_vectors);
+    defer allocator.free(token_ids);
+    const vectors = try allocator.alloc(f32, total_vectors * dim);
+    defer allocator.free(vectors);
+
+    var prng = std.Random.DefaultPrng.init(31415);
+
+    // One unit-norm theme per class, drawn from random direction.
+    const themes = try allocator.alloc(f32, n_classes * @as(usize, dim));
+    defer allocator.free(themes);
+    for (0..themes.len) |t_i| themes[t_i] = prng.random().floatNorm(f32);
+    {
+        var c: u32 = 0;
+        while (c < n_classes) : (c += 1) {
+            try vec.normalizeInPlace(themes[c * @as(usize, dim) ..][0..dim]);
+        }
+    }
+
+    // Tight (id 0..7) get small isotropic noise; wide (id 8..15) get an
+    // order of magnitude more. Same theme structure either way — the only
+    // meaningful difference is the per-token variance.
+    const sigma_tight: f32 = 0.04;
+    const sigma_wide: f32 = 0.40;
+
+    var i: usize = 0;
+    var class: u32 = 0;
+    while (class < n_classes) : (class += 1) {
+        const sigma: f32 = if (class < 8) sigma_tight else sigma_wide;
+        var s: u32 = 0;
+        while (s < samples_per_token) : (s += 1) {
+            token_ids[i] = class;
+            const out = vectors[i * @as(usize, dim) ..][0..dim];
+            const t = themes[class * @as(usize, dim) ..][0..dim];
+            for (0..dim) |dd| out[dd] = t[dd] + prng.random().floatNorm(f32) * sigma;
+            i += 1;
+        }
+    }
+
+    const kappa_total: u32 = 64;
+    const tac_params = ClusteringParams{
+        .kappa_total = kappa_total,
+        .mu = 5,
+        .tau = 16, // < samples_per_token so every class is active
+        .epsilon = 1,
+        .theta = 1,
+        .seed = 7,
+    };
+    var tac_res = try clusterFlat(token_ids, vectors, dim, tac_params, allocator);
+    defer tac_res.deinit(allocator);
+
+    var vanilla_res = try kmeans.fit(
+        vectors,
+        dim,
+        .{ .k = kappa_total, .max_iters = 25, .tol = 1e-4, .seed = 7 },
+        allocator,
+    );
+    defer vanilla_res.deinit(allocator);
+
+    var tight_kappa_sum: u32 = 0;
+    var wide_kappa_sum: u32 = 0;
+    for (tac_res.kappa_per_token[0..8]) |k| tight_kappa_sum += k;
+    for (tac_res.kappa_per_token[8..16]) |k| wide_kappa_sum += k;
+
+    const tac_wcss = tac_res.wcss_total;
+    const vanilla_wcss = vanilla_res.wcss;
+
+    std.debug.print(
+        "\n[quality §3.4 bimodal] κ={}, n_vectors={}: TAC WCSS={d:.3}, Vanilla WCSS={d:.3}, ratio={d:.3}x | tight κ-sum={}, wide κ-sum={}\n",
+        .{ kappa_total, total_vectors, tac_wcss, vanilla_wcss, tac_wcss / vanilla_wcss, tight_kappa_sum, wide_kappa_sum },
+    );
+
+    // (1) TAC's allocation must reflect spread.
+    try testing.expect(wide_kappa_sum > tight_kappa_sum);
+
+    // (2) Paper §3.4 "matches or beats" claim. Strict wins depend on budget
+    // headroom relative to ground-truth cluster count; the honest assertion
+    // is that TAC is no worse, with small slack for k-means seeding noise.
+    try testing.expect(tac_wcss <= vanilla_wcss * 1.25);
+}
