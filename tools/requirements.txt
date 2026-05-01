@@ -12,3 +12,11 @@ torch>=2.2,<3.0
 # pylate hasn't validated against.
 transformers>=4.40,<5.0
 sentence-transformers>=3.0,<4.0
+
+# Optional MLX path (post-hackathon plan-12). Apple Silicon only.
+# tools/encode_mlx.py uses these; pylate path (encode.py) does not need them.
+# Keep the upper bound conservative: mlx-lm has occasionally tightened its
+# transformers pin; if a future mlx-lm requires transformers>=5, the MLX
+# path moves into a separate venv rather than pulling pylate forward.
+mlx>=0.18; sys_platform == "darwin" and platform_machine == "arm64"
+mlx-lm>=0.20; sys_platform == "darwin" and platform_machine == "arm64"

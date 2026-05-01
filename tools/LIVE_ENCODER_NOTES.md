@@ -185,6 +185,70 @@ tokens). When retriever's #20 picks budgets for MS MARCO they will
 have plenty of active tokens (n_j ≥ τ) and can use κ_total in the
 hundreds-of-thousands range.
 
+## MLX path setup (post-hackathon plan-12, EXPERIMENTAL)
+
+`tools/encode_mlx.py` is an additive Apple-Silicon-native re-port of
+encode.py via Apple's MLX framework. **It is not a drop-in replacement
+until the 4-gate parity contract is green** — see
+`tests/live/mlx_parity.py`. Until then, encode.py is the canonical path.
+
+### Dependencies
+
+Two extra packages on top of the pylate set, gated to darwin/arm64 in
+`tools/requirements.txt`:
+
+```
+mlx>=0.18; sys_platform == "darwin" and platform_machine == "arm64"
+mlx-lm>=0.20; sys_platform == "darwin" and platform_machine == "arm64"
+```
+
+mlx-lm currently pulls a newer `transformers` and `huggingface-hub`. We
+re-pin transformers to `<5.0` afterwards so pylate's loader path keeps
+working — pylate 1.4.0 was validated against transformers 4.x. If a
+future mlx-lm hard-requires transformers 5.x, the MLX path moves into a
+separate venv rather than dragging pylate forward.
+
+Verified pin set (May 2026):
+
+| package | version |
+|---|---|
+| mlx | 0.31.2 |
+| mlx-lm | 0.31.3 |
+| transformers | 4.57.6 |
+| pylate | 1.4.0 |
+| torch | 2.9.0 |
+
+### Provisioning
+
+```bash
+uv pip install --python tools/.venv/bin/python -r tools/requirements.txt
+# mlx-lm may briefly upgrade transformers; the requirements.txt
+# transformers<5.0 pin restores it on a re-run.
+uv pip install --python tools/.venv/bin/python "transformers>=4.40,<5.0"
+```
+
+### Weight export
+
+`tools/export_colbert_to_mlx.py` walks the pylate state_dict (BERT base +
+final linear projection) and writes
+`tools/.cache/<model>/mlx_weights.safetensors`. Run once per model, then
+`encode_mlx.py` mmaps the safetensors directly.
+
+### Parity gates (status: pending — gates not yet run)
+
+| gate | status |
+|---|---|
+| 1. token-id byte equality | not run |
+| 2. cosine ≥ 0.998 mean (≥ 0.99 min) | not run |
+| 3. two-run determinism | not run |
+| 4. downstream TAC cluster overlap | not run |
+
+### Measured speedup
+
+Not yet measured. Plan 12's success criterion is **honest reporting**: if
+MLX delivers <1.5× over PyTorch FP16 on this hardware/model, this section
+will say so explicitly rather than parroting Apple's marketing 2-4×.
+
 ## Failure modes worth flagging
 
 - If a future pylate revision breaks the `model.tokenize` →
