@@ -18,8 +18,12 @@
 //!                        pq_codes u8[n_d * PQ_M], pad to 8B.
 //!                        Preceded by `doc_index [n_docs+1]u64` byte-offsets
 //!                        into this section.
-//!   7. Residual norms  — `n_tokens` f32 (paper §4 "homogeneous compression").
-//!   8. Footer          — crc32 u32 of bytes [0 .. footer_off), pad[4]u8.
+//!   7. Doc token offsets — `[n_docs+1]u64`. Mirrors `TokenDump.doc_offsets`
+//!                          shape: `[lo, hi)` global token range per doc, so
+//!                          refine (paper §5.3) can slice `residual_norms`
+//!                          for a candidate in O(1).
+//!   8. Residual norms  — `n_tokens` f32 (paper §4 "homogeneous compression").
+//!   9. Footer          — crc32 u32 of bytes [0 .. footer_off), pad[4]u8.
 //!
 //! Validation on parse:
 //!   - magic == INDEX_MAGIC                   → else error.InvalidIndex
@@ -61,6 +65,7 @@ pub const Header = extern struct {
     pq_off: u64,
     ilist_off: u64,
     doc_off: u64,
+    doc_tok_off: u64,
     norms_off: u64,
     footer_off: u64,
 };
@@ -71,7 +76,7 @@ pub const Header = extern struct {
 pub const header_region_size: usize = 128;
 
 comptime {
-    std.debug.assert(@sizeOf(Header) == 104);
+    std.debug.assert(@sizeOf(Header) == 112);
     std.debug.assert(header_region_size >= @sizeOf(Header));
     std.debug.assert(header_region_size % 8 == 0);
 }
@@ -88,6 +93,10 @@ pub const Index = struct {
     /// `n_docs+1` byte offsets into `doc_payload` (per-doc start).
     doc_index: []const u64,
     doc_payload: []const u8,
+    /// `n_docs+1` global token offsets — `[doc_token_offsets[d], doc_token_offsets[d+1])`
+    /// is the half-open token range of doc d, mirroring `TokenDump.doc_offsets`.
+    /// Refine slices `residual_norms` against this in O(1) per candidate doc.
+    doc_token_offsets: []const u64,
     residual_norms: []const f32,
 
     pub fn deinit(self: *Index, gpa: Allocator) void {
@@ -104,6 +113,13 @@ pub const Index = struct {
         const lo: usize = @intCast(self.doc_index[d]);
         const hi: usize = @intCast(self.doc_index[d + 1]);
         return self.doc_payload[lo..hi];
+    }
+
+    /// Half-open `[lo, hi)` global token range of doc `d`. Mirrors the
+    /// `TokenDump.doc_offsets` semantics. Use to slice `residual_norms`
+    /// (and any future per-token side table) for a candidate doc in O(1).
+    pub fn docTokenRange(self: *const Index, d: u32) [2]u64 {
+        return .{ self.doc_token_offsets[d], self.doc_token_offsets[d + 1] };
     }
 };
 
@@ -124,6 +140,8 @@ pub const BuildOutput = struct {
     /// Used to emit the per-doc Pass 2 region.
     pq_codes: []const u8,
     /// Doc offsets (CSR): `doc_offsets[d+1] - doc_offsets[d]` = n_d.
+    /// Persisted as the `doc_token_offsets` section so refine can slice
+    /// `residual_norms` per candidate doc in O(1).
     doc_offsets: []const u64,
     pq: *const pq_mod.PQ,
     hnsw: *const hnsw_mod.Hnsw,
@@ -353,6 +371,9 @@ pub fn computeSize(out: BuildOutput) u64 {
     off += (out.n_docs + 1) * @sizeOf(u64);
     off += docPayloadSize(out);
     off = alignUp(off, 8);
+    // doc_token_offsets [n_docs+1]u64 (CSR token range per doc, paper §4 + §5.3)
+    off += (out.n_docs + 1) * @sizeOf(u64);
+    off = alignUp(off, 8);
     // residual norms
     off += out.n_tokens * @sizeOf(f32);
     off = alignUp(off, 8);
@@ -450,6 +471,15 @@ pub fn serialise(out: BuildOutput, buf: []u8) StorageError!u64 {
     cur += try writeDocLayouts(out, buf[@intCast(cur)..]);
     cur = alignUp(cur, 8);
 
+    // ---- Doc token offsets (paper §5.3 refine slicing) ----
+    const doc_tok_off = cur;
+    {
+        const dto_bytes = std.mem.sliceAsBytes(out.doc_offsets);
+        std.mem.copyForwards(u8, buf[@intCast(cur)..][0..dto_bytes.len], dto_bytes);
+        cur += @as(u64, dto_bytes.len);
+        cur = alignUp(cur, 8);
+    }
+
     // ---- Residual norms ----
     const norms_off = cur;
     {
@@ -478,6 +508,7 @@ pub fn serialise(out: BuildOutput, buf: []u8) StorageError!u64 {
         .pq_off = pq_off,
         .ilist_off = ilist_off,
         .doc_off = doc_off,
+        .doc_tok_off = doc_tok_off,
         .norms_off = norms_off,
         .footer_off = footer_off,
     };
@@ -613,9 +644,9 @@ pub fn parse(bytes: []align(8) const u8, gpa: Allocator) StorageError!Index {
 
     // Section offsets must be monotonic and within bounds.
     const offs = [_]u64{
-        hdr.centroids_off, hdr.hnsw_off,  hdr.pq_off,
-        hdr.ilist_off,     hdr.doc_off,   hdr.norms_off,
-        hdr.footer_off,
+        hdr.centroids_off, hdr.hnsw_off,    hdr.pq_off,
+        hdr.ilist_off,     hdr.doc_off,     hdr.doc_tok_off,
+        hdr.norms_off,     hdr.footer_off,
     };
     if (offs[0] != header_region_size) return error.InvalidIndex;
     var i: usize = 1;
@@ -658,12 +689,19 @@ pub fn parse(bytes: []align(8) const u8, gpa: Allocator) StorageError!Index {
     errdefer if (ilists_view.owns_buffers) ilists_view.deinit(gpa);
 
     // ---- Per-doc index + payload (alias slices) ----
-    const doc_section = bytes[@intCast(hdr.doc_off)..@intCast(hdr.norms_off)];
+    const doc_section = bytes[@intCast(hdr.doc_off)..@intCast(hdr.doc_tok_off)];
     const doc_index_bytes_len: usize = @intCast((hdr.n_docs + 1) * @sizeOf(u64));
     if (doc_section.len < doc_index_bytes_len) return error.InvalidIndex;
     const doc_index_aligned: []align(@alignOf(u64)) const u8 = @alignCast(doc_section[0..doc_index_bytes_len]);
     const doc_index_slice = std.mem.bytesAsSlice(u64, doc_index_aligned);
     const doc_payload_slice = doc_section[doc_index_bytes_len..];
+
+    // ---- Doc token offsets (alias) ----
+    const doc_tok_bytes = bytes[@intCast(hdr.doc_tok_off)..@intCast(hdr.norms_off)];
+    const doc_tok_bytes_len: usize = @intCast((hdr.n_docs + 1) * @sizeOf(u64));
+    if (doc_tok_bytes.len < doc_tok_bytes_len) return error.InvalidIndex;
+    const doc_tok_aligned: []align(@alignOf(u64)) const u8 = @alignCast(doc_tok_bytes[0..doc_tok_bytes_len]);
+    const doc_token_offsets_slice = std.mem.bytesAsSlice(u64, doc_tok_aligned);
 
     // ---- Residual norms (alias) ----
     const norms_bytes = bytes[@intCast(hdr.norms_off)..@intCast(hdr.footer_off)];
@@ -680,6 +718,7 @@ pub fn parse(bytes: []align(8) const u8, gpa: Allocator) StorageError!Index {
         .ilists = ilists_view,
         .doc_index = doc_index_slice,
         .doc_payload = doc_payload_slice,
+        .doc_token_offsets = doc_token_offsets_slice,
         .residual_norms = norms_slice,
     };
 }
@@ -811,12 +850,13 @@ const rng_mod = @import("../util/rng.zig");
 const vec = @import("../util/vec.zig");
 
 test "Header layout sanity" {
-    try testing.expectEqual(@as(usize, 104), @sizeOf(Header));
+    // v2 adds doc_tok_off u64 between doc_off and norms_off → +8 vs v1's 104.
+    try testing.expectEqual(@as(usize, 112), @sizeOf(Header));
 }
 
 test "magic + version constants match paper repo conventions" {
     try testing.expectEqualSlices(u8, "TAC_IDX1", &constants.INDEX_MAGIC);
-    try testing.expectEqual(@as(u32, 1), constants.INDEX_VERSION);
+    try testing.expectEqual(@as(u32, 2), constants.INDEX_VERSION);
 }
 
 /// Build a tiny fixture (paper-strict M=32 forces dim multiples of 32).
@@ -985,6 +1025,9 @@ test "round-trip: serialise then parse recovers every section" {
     // Residual norms.
     try testing.expectEqualSlices(f32, fx.residual_norms, idx.residual_norms);
 
+    // Doc token offsets round-trip and match TokenDump.doc_offsets shape.
+    try testing.expectEqualSlices(u64, fx.doc_offsets, idx.doc_token_offsets);
+
     // Per-doc layout: each doc decodes to (n_d, centroid_ids, pq_codes).
     var d: u32 = 0;
     while (d < out.n_docs) : (d += 1) {
@@ -993,6 +1036,10 @@ test "round-trip: serialise then parse recovers every section" {
         const tok_lo: u64 = fx.doc_offsets[d];
         const tok_hi: u64 = fx.doc_offsets[d + 1];
         try testing.expectEqual(@as(u32, @intCast(tok_hi - tok_lo)), n_d_back);
+        // docTokenRange agrees with the source TokenDump CSR.
+        const range = idx.docTokenRange(d);
+        try testing.expectEqual(tok_lo, range[0]);
+        try testing.expectEqual(tok_hi, range[1]);
         // Pass 1 region matches assignments slice byte-for-byte.
         const pass1 = slice[4 .. 4 + n_d_back * 4];
         const expected_pass1 = std.mem.sliceAsBytes(

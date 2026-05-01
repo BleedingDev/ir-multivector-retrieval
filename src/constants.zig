@@ -30,7 +30,7 @@ pub fn hnswEfSearch(kappa_c: u32) u32 {
 pub const TOKEN_DUMP_MAGIC: [8]u8 = "TAC_TKN1".*;
 pub const INDEX_MAGIC: [8]u8 = "TAC_IDX1".*;
 pub const TOKEN_DUMP_VERSION: u32 = 2; // v1 → v2: real BERT vocab IDs (paper §3 fidelity, task #21)
-pub const INDEX_VERSION: u32 = 1;
+pub const INDEX_VERSION: u32 = 2; // v1 → v2: doc_token_offsets section for O(1) refine norm lookup
 
 test "ef_s = ceil(1.5 · κ_c) per paper §5.1" {
     const std = @import("std");
