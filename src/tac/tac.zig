@@ -1172,3 +1172,120 @@ test "cluster: integration with synthetic_fixture (paper-style Zipf vocab)" {
     for (res.assignments) |a| try testing.expect(a < 64);
     try testing.expect(std.math.isFinite(res.wcss_total));
 }
+
+// ---------------------------------------------------------------------------
+// Quality regression: TAC vs vanilla k-means at fixed κ (paper §3.4).
+// ---------------------------------------------------------------------------
+//
+// The paper's headline claim (§3.4): at the same total centroid budget κ,
+// TAC matches or beats vanilla k-means on clustering quality, because the
+// damped allocation directs centroids to high-spread (semantically rich)
+// tokens rather than flooding common tokens.
+//
+// Test approach: build a Zipfian-frequency synthetic corpus with per-token
+// themes — common tokens cluster tightly around a single direction, rare
+// tokens have higher intra-token spread (multiple sub-themes). Compare:
+//   (a) TAC: Σ_j WCSS_j  — sum of per-token Lloyd's residuals.
+//   (b) Vanilla: WCSS of one global Lloyd's run with k = kappa_total over
+//       all vectors, no token awareness.
+// Both metrics measure squared distance to assigned centroid summed over
+// all input vectors; lower is better.
+//
+// On a token-skewed corpus, TAC should be at most a small constant worse
+// than vanilla in absolute WCSS (and often better) because it allocates
+// centroids where they're most useful per the damped weight. This test
+// asserts TAC ≤ 1.25·Vanilla; we don't pin a tighter bound because the
+// margin depends on the noise scale and the centroid-per-token budget.
+
+fn computeGlobalWcss(
+    vectors: []const f32,
+    dim: u32,
+    centroids: []const f32,
+    k: u32,
+    gpa: Allocator,
+) !f32 {
+    const n: usize = vectors.len / @as(usize, dim);
+    const dist_buf = try gpa.alloc(f32, k);
+    defer gpa.free(dist_buf);
+
+    var wcss: f32 = 0.0;
+    for (0..n) |i| {
+        for (0..k) |c| {
+            dist_buf[c] = try vec.l2sq(
+                vectors[i * @as(usize, dim) ..][0..dim],
+                centroids[c * @as(usize, dim) ..][0..dim],
+            );
+        }
+        const a = try vec.argmin(dist_buf);
+        wcss += dist_buf[a];
+    }
+    return wcss;
+}
+
+test "quality regression: TAC matches or beats vanilla k-means at fixed κ" {
+    const allocator = testing.allocator;
+    const synthetic = @import("../io/synthetic_fixture.zig");
+
+    // Paper-scale-mini Zipf corpus: token ids drawn from 1/(rank+1) so a
+    // few tokens dominate frequency — exactly the regime TAC was designed
+    // for (paper §2 motivation).
+    var fx = try synthetic.build(allocator, .{
+        .seed = 2026,
+        .n_docs = 200,
+        .dim = 16,
+        .vocab_size = 32,
+        .avg_doc_len = 12,
+    });
+    defer fx.deinit(allocator);
+
+    const kappa_total: u32 = 96;
+
+    // (a) TAC.
+    const tac_params = ClusteringParams{
+        .kappa_total = kappa_total,
+        .mu = 5,
+        .tau = 15,
+        .epsilon = 1,
+        .theta = 1,
+        .seed = 7,
+    };
+    var tac_res = try clusterFlat(
+        fx.token_ids,
+        fx.vectors,
+        fx.dim,
+        tac_params,
+        allocator,
+    );
+    defer tac_res.deinit(allocator);
+
+    // (b) Vanilla k-means with same kappa_total over all vectors.
+    var vanilla_res = try kmeans.fit(
+        fx.vectors,
+        fx.dim,
+        .{
+            .k = kappa_total,
+            .max_iters = 25,
+            .tol = 1e-4,
+            .seed = 7,
+        },
+        allocator,
+    );
+    defer vanilla_res.deinit(allocator);
+
+    // For TAC, wcss_total is already the sum of per-token Lloyd's WCSS,
+    // which is the same as Σ_i ‖v_i - c_{a_i}‖² across all input vectors
+    // since each vector contributes exactly once.
+    const tac_wcss = tac_res.wcss_total;
+    const vanilla_wcss = vanilla_res.wcss;
+
+    // Log the comparison so a CI failure is debuggable.
+    std.debug.print(
+        "\n[quality §3.4] κ={}, n_vectors={}: TAC WCSS={d:.3}, Vanilla WCSS={d:.3}, ratio={d:.3}x\n",
+        .{ kappa_total, fx.n_tokens, tac_wcss, vanilla_wcss, tac_wcss / vanilla_wcss },
+    );
+
+    // Paper §3.4 claim: TAC matches or beats vanilla. We allow a modest 25%
+    // tolerance because the synthetic corpus and per-token theme noise make
+    // exact ties unrealistic and we don't tune κ_c/κ_d here.
+    try testing.expect(tac_wcss <= vanilla_wcss * 1.25);
+}
