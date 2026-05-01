@@ -266,9 +266,15 @@ def main() -> None:
     )
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Write a dtype-specific filename so the encoder can pick a file that
+    # already matches the runtime dtype and skip the per-tensor astype loop.
+    # Keep writing the legacy mlx_weights.safetensors path too so older
+    # encoder builds keep working without a re-export.
+    dtype_path = out_dir / f"mlx_weights.{args.dtype}.safetensors"
     safetensors_path = out_dir / "mlx_weights.safetensors"
     config_path = out_dir / "config.json"
 
+    mx.save_safetensors(str(dtype_path), out_weights)
     mx.save_safetensors(str(safetensors_path), out_weights)
 
     config = {
@@ -297,7 +303,7 @@ def main() -> None:
 
     total_bytes = safetensors_path.stat().st_size
     print(
-        f"wrote {safetensors_path} "
+        f"wrote {dtype_path} and {safetensors_path} "
         f"({len(out_weights)} tensors, {total_bytes / 1024 / 1024:.1f} MB, "
         f"{args.dtype})",
         file=sys.stderr,

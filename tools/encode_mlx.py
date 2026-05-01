@@ -352,10 +352,22 @@ def encode_docs_mlx(
         raise SystemExit(f"config.json missing next to {weights_path}")
     cfg = json.loads(config_path.read_text(encoding="utf-8"))
 
-    weights = mx.load(str(weights_path))
     compute_dtype = mx.float16 if dtype == "fp16" else mx.float32
-    # Cast weights to compute dtype so the forward pass is consistent.
-    weights = {k: v.astype(compute_dtype) for k, v in weights.items()}
+    # Prefer a dtype-specific export sibling so we don't pay an astype on
+    # every weight at startup. Falls back to the legacy single-file export
+    # with a per-tensor astype if the sibling isn't there.
+    dtype_specific = weights_path.parent / f"mlx_weights.{dtype}.safetensors"
+    if dtype_specific.exists():
+        weights = mx.load(str(dtype_specific))
+        if cfg.get("weight_dtype") != dtype:
+            # Sibling exists but config disagrees with its dtype (mixed
+            # export). Be safe and re-cast.
+            weights = {k: v.astype(compute_dtype) for k, v in weights.items()}
+    else:
+        weights = mx.load(str(weights_path))
+        # Skip the per-tensor astype if the file already matches runtime dtype.
+        if cfg.get("weight_dtype") != dtype:
+            weights = {k: v.astype(compute_dtype) for k, v in weights.items()}
 
     model = ColBertMLX(cfg)
     _load_weights_into_model(model, weights)
